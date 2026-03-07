@@ -1,8 +1,8 @@
 # Roadmap
 
-## Current: v0.26.0
+## Current: v0.27.0
 
-All agent experience features shipped. CLI-only (MCP removed in v0.10.0). 46 languages. Two full audits complete (v0.12.3 + v0.19.2).
+All agent experience features shipped. CLI-only (MCP removed in v0.10.0). 47 languages. Two full audits complete (v0.12.3 + v0.19.2). Recursive multi-grammar injection framework.
 
 ### Next — Commands
 
@@ -37,8 +37,11 @@ All agent experience features shipped. CLI-only (MCP removed in v0.10.0). 46 lan
 - [x] **Solidity** — Contracts, interfaces, libraries, call graph. Expression supertype workaround.
 - [x] **CUDA** — Reuses C++ queries. Kernel-specific stopwords.
 - [x] **GLSL** — Reuses C queries. Shader-specific stopwords.
+- [x] **Svelte** — `tree-sitter-svelte-next`. Injection: `script_element/raw_text→JS`, `style_element/raw_text→CSS`. Reuses HTML helpers.
 - [ ] **Clojure** — Blocked: `tree-sitter-clojure` 0.1.0 requires tree-sitter ^0.25, incompatible with 0.26.
 - [ ] **Dart** — Blocked: old tree-sitter API (pre-0.24). Property covers properties, mixin → Trait.
+- [x] **Razor/CSHTML** — `tris203/tree-sitter-razor` (git dep, forked). Monolithic grammar: C# + HTML + Razor directives. JS/CSS injection via `_inner` content mode.
+- [x] **VB.NET** — `CodeAnt-AI/tree-sitter-vb-dotnet` (git dep, forked). Classes, modules, structures, interfaces, enums, methods, properties, events, delegates.
 - [ ] **ArchestrA QuickScript** — No tree-sitter grammar exists. Needs custom grammar from scratch (VB-like syntax).
 
 ### ChunkType Variant Status
@@ -61,19 +64,17 @@ Injection framework shipped in v0.27.0 (PRs #540, #544). `InjectionRule` on `Lan
 **Done:**
 - [x] HTML → JavaScript (with TypeScript detection via `lang`/`type` attrs)
 - [x] HTML → CSS
-
-**Next — High value (both grammars already exist):**
-- [ ] PHP → HTML → JS/CSS — chained injection. PHP `text` nodes contain HTML, then HTML's existing rules extract JS/CSS. Three-layer extraction.
+- [x] PHP → HTML → JS/CSS — recursive injection (depth limit 3). Two injection rules: `program/text` (leading HTML) + `text_interpolation/text` (HTML after `?>`). `content_scoped_lines` prevents container-spans-file problem.
+- [x] Svelte → JS/TS, CSS — `tree-sitter-svelte-next`. Reuses HTML's `detect_script_language` for TypeScript detection.
+- [x] LaTeX → code listings — `minted_environment` + `listing_environment`. Language detection from `\begin{minted}{python}` and `[language=Rust]` options.
+- [x] Nix → Bash — `indented_string_expression` in shell contexts (buildPhase, installPhase, shellHook, etc.). `detect_nix_shell_context` checks parent binding name.
+- [x] HCL → Bash — `heredoc_template` with shell identifiers (EOT, BASH, SHELL, etc.). `detect_heredoc_language` checks heredoc identifier.
 
 **Next — New grammars required:**
 - [ ] Vue (.vue) → JS/TS, CSS, HTML — needs `tree-sitter-vue` grammar. `<script>`, `<style>`, `<template>` identical to HTML injection pattern.
-- [ ] Svelte (.svelte) → JS/TS, CSS — needs `tree-sitter-svelte` grammar. Same pattern as Vue.
 
-**Medium value (narrower scope):**
+**Next — Medium value (narrower scope):**
 - [ ] Markdown → fenced code blocks — custom parser, not tree-sitter. Needs different approach (parse ` ```lang ` content with target grammar).
-- [ ] LaTeX → code listings — `\begin{lstlisting}` / minted blocks → target language.
-- [ ] Nix → Bash — shell scripts in `writeShellScript`, derivation phase strings.
-- [ ] HCL → Bash — `provisioner "local-exec"` command blocks.
 - [ ] YAML → Bash — GitHub Actions `run:` blocks. Detection fragile (not all strings are scripts).
 
 **Lower priority (niche or fragile):**
@@ -88,7 +89,6 @@ Injection framework shipped in v0.27.0 (PRs #540, #544). `InjectionRule` on `Lan
 ### Parked
 
 - **MCP server** — re-add as slim read-only wrapper when CLI features are rock solid. Architecture proven clean (removed in v0.10.0 with zero core changes).
-- **VB.NET** — `tree-sitter-vb-dotnet` (git dep). VS2005 project delayed.
 - **Pre-built reference packages** (#255) — `cqs ref install tokio`
 - **Index encryption** — SQLCipher behind cargo feature flag
 - **Query-intent routing** — auto-boost ref weight when query mentions product names

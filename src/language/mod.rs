@@ -171,6 +171,11 @@ pub struct InjectionRule {
     pub target_language: &'static str,
     /// Optional: detect language from container attributes (e.g., `<script lang="ts">`)
     pub detect_language: Option<fn(tree_sitter::Node, &str) -> Option<&'static str>>,
+    /// When true, `container_lines` derives from each content child's line range
+    /// instead of the container's line range. Required for languages like PHP where
+    /// the container is `program` (entire file) but content is individual `text`
+    /// nodes between `<?php ... ?>` blocks.
+    pub content_scoped_lines: bool,
 }
 
 /// A language definition with all parsing configuration
@@ -623,6 +628,12 @@ define_languages! {
     Cuda => "cuda", feature = "lang-cuda", module = cuda;
     /// GLSL (.glsl, .vert, .frag, .geom, .comp, .tesc, .tese files)
     Glsl => "glsl", feature = "lang-glsl", module = glsl;
+    /// Svelte (.svelte files)
+    Svelte => "svelte", feature = "lang-svelte", module = svelte;
+    /// Razor/CSHTML (.cshtml, .razor files)
+    Razor => "razor", feature = "lang-razor", module = razor;
+    /// VB.NET (.vb files)
+    VbNet => "vbnet", feature = "lang-vbnet", module = vbnet;
     /// Markdown (.md, .mdx files)
     Markdown => "markdown", feature = "lang-markdown", module = markdown;
 }
@@ -1066,6 +1077,18 @@ mod tests {
             expected += 1;
         }
         #[cfg(feature = "lang-markdown")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "lang-svelte")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "lang-razor")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "lang-vbnet")]
         {
             expected += 1;
         }
