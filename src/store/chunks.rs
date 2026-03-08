@@ -20,6 +20,7 @@ impl Store {
     /// Returns `Ok(value)` if the key exists, or `Err` if not found or on DB error.
     /// Used for lightweight metadata checks (e.g., model compatibility between stores).
     pub fn get_metadata(&self, key: &str) -> Result<String, StoreError> {
+        let _span = tracing::debug_span!("get_metadata", key = %key).entered();
         self.rt.block_on(async {
             let row: Option<(String,)> =
                 sqlx::query_as("SELECT value FROM metadata WHERE key = ?1")
@@ -160,6 +161,7 @@ impl Store {
         embedding: &Embedding,
         source_mtime: Option<i64>,
     ) -> Result<(), StoreError> {
+        let _span = tracing::info_span!("upsert_chunk", name = %chunk.name).entered();
         self.upsert_chunks_batch(&[(chunk.clone(), embedding.clone())], source_mtime)?;
         Ok(())
     }
@@ -169,6 +171,7 @@ impl Store {
     /// Returns `Ok(Some(mtime))` if reindex needed (with the file's current mtime),
     /// or `Ok(None)` if no reindex needed. This avoids reading file metadata twice.
     pub fn needs_reindex(&self, path: &Path) -> Result<Option<i64>, StoreError> {
+        let _span = tracing::debug_span!("needs_reindex", path = %path.display()).entered();
         let current_mtime = path
             .metadata()?
             .modified()?
@@ -554,6 +557,7 @@ impl Store {
         &self,
         existing_files: &HashSet<PathBuf>,
     ) -> Result<(u64, u64), StoreError> {
+        let _span = tracing::debug_span!("count_stale_files").entered();
         let report = self.list_stale_files(existing_files)?;
         Ok((report.stale.len() as u64, report.missing.len() as u64))
     }
@@ -566,6 +570,7 @@ impl Store {
         &self,
         existing_files: &HashSet<PathBuf>,
     ) -> Result<StaleReport, StoreError> {
+        let _span = tracing::debug_span!("list_stale_files").entered();
         self.rt.block_on(async {
             let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
                 "SELECT DISTINCT origin, source_mtime FROM chunks WHERE source_type = 'file'",
@@ -698,6 +703,7 @@ impl Store {
     ///
     /// Note: Prefer `get_embeddings_by_hashes` for batch lookups in production.
     pub fn get_by_content_hash(&self, hash: &str) -> Option<Embedding> {
+        let _span = tracing::debug_span!("get_by_content_hash", hash = %hash).entered();
         self.rt.block_on(async {
             let row: Option<(Vec<u8>,)> = match sqlx::query_as(
                 "SELECT embedding FROM chunks WHERE content_hash = ?1 LIMIT 1",
@@ -724,6 +730,8 @@ impl Store {
         &self,
         hashes: &[&str],
     ) -> Result<HashMap<String, Embedding>, StoreError> {
+        let _span =
+            tracing::debug_span!("get_embeddings_by_hashes", count = hashes.len()).entered();
         if hashes.is_empty() {
             return Ok(HashMap::new());
         }
@@ -764,6 +772,7 @@ impl Store {
 
     /// Get the number of chunks in the index
     pub fn chunk_count(&self) -> Result<u64, StoreError> {
+        let _span = tracing::debug_span!("chunk_count").entered();
         self.rt.block_on(async {
             let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
                 .fetch_one(&self.pool)
@@ -778,6 +787,7 @@ impl Store {
     /// 1. Single query for counts with GROUP BY using CTEs
     /// 2. Single query for all metadata keys
     pub fn stats(&self) -> Result<IndexStats, StoreError> {
+        let _span = tracing::debug_span!("stats").entered();
         self.rt.block_on(async {
             // Combined counts query using CTEs (3 queries → 1)
             let (total_chunks, total_files): (i64, i64) = sqlx::query_as(
@@ -873,6 +883,7 @@ impl Store {
     /// Returns chunks sorted by line_start. Used by `cqs context` to list
     /// all functions/types in a file.
     pub fn get_chunks_by_origin(&self, origin: &str) -> Result<Vec<ChunkSummary>, StoreError> {
+        let _span = tracing::debug_span!("get_chunks_by_origin", origin = %origin).entered();
         self.rt.block_on(async {
             let rows: Vec<_> = sqlx::query(
                 "SELECT id, origin, language, chunk_type, name, signature, content, doc,
@@ -900,6 +911,8 @@ impl Store {
         &self,
         origins: &[&str],
     ) -> Result<HashMap<String, Vec<ChunkSummary>>, StoreError> {
+        let _span =
+            tracing::debug_span!("get_chunks_by_origins_batch", count = origins.len()).entered();
         if origins.is_empty() {
             return Ok(HashMap::new());
         }
@@ -945,6 +958,8 @@ impl Store {
         &self,
         names: &[&str],
     ) -> Result<HashMap<String, Vec<ChunkSummary>>, StoreError> {
+        let _span =
+            tracing::debug_span!("get_chunks_by_names_batch", count = names.len()).entered();
         if names.is_empty() {
             return Ok(HashMap::new());
         }
@@ -994,6 +1009,7 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<(ChunkSummary, Embedding)>, StoreError> {
+        let _span = tracing::debug_span!("get_chunk_with_embedding", id = %id).entered();
         self.rt.block_on(async {
             let results = self
                 .fetch_chunks_with_embeddings_by_ids_async(&[id])
@@ -1018,6 +1034,7 @@ impl Store {
         &self,
         ids: &[&str],
     ) -> Result<HashMap<String, ChunkSummary>, StoreError> {
+        let _span = tracing::debug_span!("get_chunks_by_ids", count = ids.len()).entered();
         self.rt.block_on(async {
             let rows = self.fetch_chunks_by_ids_async(ids).await?;
             Ok(rows
@@ -1038,6 +1055,7 @@ impl Store {
         &self,
         ids: &[&str],
     ) -> Result<HashMap<String, Embedding>, StoreError> {
+        let _span = tracing::debug_span!("get_embeddings_by_ids", count = ids.len()).entered();
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1141,19 +1159,7 @@ impl Store {
 
                 // Post-filter: assign each row to matching names
                 for row in rows {
-                    let chunk = ChunkSummary::from(ChunkRow {
-                        id: row.get(0),
-                        origin: row.get(1),
-                        language: row.get(2),
-                        chunk_type: row.get(3),
-                        name: row.get(4),
-                        signature: row.get(5),
-                        content: row.get(6),
-                        doc: row.get(7),
-                        line_start: clamp_line_number(row.get::<i64, _>(8)),
-                        line_end: clamp_line_number(row.get::<i64, _>(9)),
-                        parent_id: row.get(10),
-                    });
+                    let chunk = ChunkSummary::from(ChunkRow::from_row(&row));
 
                     // Find which query names this result matches
                     for (original_name, _normalized) in batch {
@@ -1181,6 +1187,7 @@ impl Store {
     /// Returns minimal metadata needed to match chunks across stores.
     /// Loads all rows but only lightweight columns (no content or embeddings).
     pub fn all_chunk_identities(&self) -> Result<Vec<ChunkIdentity>, StoreError> {
+        let _span = tracing::debug_span!("all_chunk_identities").entered();
         self.all_chunk_identities_filtered(None)
     }
 
@@ -1192,6 +1199,8 @@ impl Store {
         &self,
         language: Option<&str>,
     ) -> Result<Vec<ChunkIdentity>, StoreError> {
+        let _span =
+            tracing::debug_span!("all_chunk_identities_filtered", language = ?language).entered();
         self.rt.block_on(async {
             let rows: Vec<_> = if let Some(lang) = language {
                 sqlx::query(
@@ -1389,6 +1398,7 @@ impl Store {
         &self,
         batch_size: usize,
     ) -> impl Iterator<Item = Result<Vec<(String, Embedding)>, StoreError>> + '_ {
+        let _span = tracing::debug_span!("embedding_batches", batch_size = batch_size).entered();
         EmbeddingBatchIterator {
             store: self,
             batch_size,
