@@ -34,19 +34,17 @@ impl ProjectRegistry {
         if !path.exists() {
             return Ok(Self::default());
         }
-        // Size guard: project registry should be well under 1MB
-        const MAX_REGISTRY_SIZE: u64 = 1024 * 1024;
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > MAX_REGISTRY_SIZE {
-                anyhow::bail!(
-                    "Project registry too large: {}KB (limit {}KB)",
-                    meta.len() / 1024,
-                    MAX_REGISTRY_SIZE / 1024
-                );
-            }
-        }
+        // Read first, then enforce the size guard — avoids TOCTOU between stat and read.
+        const MAX_REGISTRY_SIZE: usize = 1024 * 1024;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
+        if content.len() > MAX_REGISTRY_SIZE {
+            anyhow::bail!(
+                "Project registry too large: {}KB (limit {}KB)",
+                content.len() / 1024,
+                MAX_REGISTRY_SIZE / 1024
+            );
+        }
         toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
@@ -80,12 +78,7 @@ impl ProjectRegistry {
 
         let content = toml::to_string_pretty(self)?;
         // Atomic write: temp file + rename (unpredictable suffix to prevent symlink attacks)
-        let suffix = {
-            use std::hash::{BuildHasher, Hasher};
-            std::collections::hash_map::RandomState::new()
-                .build_hasher()
-                .finish()
-        };
+        let suffix = crate::temp_suffix();
         let tmp = path.with_extension(format!("toml.{:016x}.tmp", suffix));
         std::fs::write(&tmp, &content)
             .with_context(|| format!("Failed to write {}", tmp.display()))?;

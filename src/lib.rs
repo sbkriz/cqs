@@ -77,7 +77,7 @@ pub(crate) mod onboard;
 pub(crate) mod project;
 pub(crate) mod related;
 pub(crate) mod review;
-pub use review::{review_diff, ReviewResult};
+pub use review::{review_diff, ReviewNoteEntry, ReviewResult};
 pub(crate) mod scout;
 pub(crate) mod search;
 pub(crate) mod structural;
@@ -101,11 +101,11 @@ pub use store::{ModelInfo, SearchFilter, Store};
 
 // Re-exports for binary crate (CLI) - these are NOT part of the public library API
 // but need to be accessible to src/cli/* and tests/
-pub use diff::{semantic_diff, DiffResult};
+pub use diff::{semantic_diff, DiffEntry, DiffResult};
 pub use focused_read::COMMON_TYPES;
 pub use gather::{
-    gather, gather_cross_index, gather_with_graph, GatherDirection, GatherOptions, GatherResult,
-    GatheredChunk, DEFAULT_MAX_EXPANDED_NODES,
+    gather, gather_cross_index, gather_cross_index_with_index, gather_with_graph, GatherDirection,
+    GatherOptions, GatherResult, GatheredChunk, DEFAULT_MAX_EXPANDED_NODES,
 };
 pub use impact::{
     analyze_diff_impact, analyze_impact, compute_hints, compute_hints_with_graph,
@@ -129,12 +129,13 @@ pub use scout::{
 pub use search::{parse_target, resolve_target, ResolvedTarget};
 pub use structural::Pattern;
 pub use task::{
-    extract_modify_targets, task, task_to_json, task_with_resources, TaskResult, TaskSummary,
+    extract_modify_targets, task, task_to_json, task_with_resources, FunctionRisk, TaskResult,
+    TaskSummary,
 };
 pub use where_to_add::{
-    suggest_placement, suggest_placement_with_embedding, suggest_placement_with_options,
-    FileSuggestion, LocalPatterns, PlacementOptions, PlacementResult,
-    DEFAULT_PLACEMENT_SEARCH_LIMIT, DEFAULT_PLACEMENT_SEARCH_THRESHOLD,
+    suggest_placement, suggest_placement_with_options, FileSuggestion, LocalPatterns,
+    PlacementOptions, PlacementResult, DEFAULT_PLACEMENT_SEARCH_LIMIT,
+    DEFAULT_PLACEMENT_SEARCH_THRESHOLD,
 };
 
 #[cfg(feature = "gpu-index")]
@@ -234,6 +235,18 @@ pub fn normalize_path(path: &Path) -> String {
 /// For already-stringified paths. Returns the input unchanged on Unix.
 pub fn normalize_slashes(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+/// Generate an unpredictable u64 suffix for temporary file names.
+///
+/// Uses [`std::collections::hash_map::RandomState`] (seeded by the OS on each
+/// process start) to produce a value that is different every run and resists
+/// symlink-based TOCTOU attacks on temp-file paths.
+pub fn temp_suffix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 /// Serde serializer for `PathBuf` fields: forward-slash normalized.

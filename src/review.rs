@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use crate::AnalysisError;
 
 use crate::diff_parse::parse_unified_diff;
 use crate::impact::{
@@ -26,7 +26,7 @@ pub struct ReviewResult {
     /// Tests affected by or suggested for the changes (uses impact's DiffTestInfo directly)
     pub affected_tests: Vec<DiffTestInfo>,
     /// Notes relevant to changed files
-    pub relevant_notes: Vec<NoteEntry>,
+    pub relevant_notes: Vec<ReviewNoteEntry>,
     /// Aggregated risk summary
     pub risk_summary: RiskSummary,
     /// Files that are stale in the index (if any)
@@ -40,14 +40,17 @@ pub struct ReviewResult {
 #[derive(Debug, serde::Serialize)]
 pub struct ReviewedFunction {
     pub name: String,
-    pub file: String,
+    pub file: PathBuf,
     pub line_start: u32,
     pub risk: RiskScore,
 }
 
 /// A note relevant to the review.
+///
+/// Named `ReviewNoteEntry` to avoid collision with `note::NoteEntry`
+/// (parsed note from TOML) which is a different type.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct NoteEntry {
+pub struct ReviewNoteEntry {
     pub text: String,
     pub sentiment: f32,
     pub matching_files: Vec<String>,
@@ -71,7 +74,11 @@ pub struct RiskSummary {
 /// 4. Risk scoring -> per-function risk
 /// 5. Note matching -> relevant notes for changed files (non-fatal)
 /// 6. Staleness check -> warn if changed files are stale (non-fatal)
-pub fn review_diff(store: &Store, diff_text: &str, root: &Path) -> Result<Option<ReviewResult>> {
+pub fn review_diff(
+    store: &Store,
+    diff_text: &str,
+    root: &Path,
+) -> Result<Option<ReviewResult>, AnalysisError> {
     let _span = tracing::info_span!("review_diff").entered();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -116,11 +123,12 @@ pub fn review_diff(store: &Store, diff_text: &str, root: &Path) -> Result<Option
         .collect();
 
     // 7. Match notes to changed files (non-fatal: warning on failure)
-    let changed_files: HashSet<&str> = impact
+    let changed_file_strings: Vec<String> = impact
         .changed_functions
         .iter()
-        .map(|f| f.file.as_str())
+        .map(|f| f.file.to_string_lossy().into_owned())
         .collect();
+    let changed_files: HashSet<&str> = changed_file_strings.iter().map(|s| s.as_str()).collect();
     let relevant_notes = match match_notes(store, &changed_files) {
         Ok(notes) => notes,
         Err(e) => {
@@ -180,7 +188,10 @@ pub fn review_diff(store: &Store, diff_text: &str, root: &Path) -> Result<Option
 /// Match notes to a set of changed file paths.
 ///
 /// Returns an error if notes cannot be loaded (caller decides how to handle).
-fn match_notes(store: &Store, changed_files: &HashSet<&str>) -> Result<Vec<NoteEntry>> {
+fn match_notes(
+    store: &Store,
+    changed_files: &HashSet<&str>,
+) -> Result<Vec<ReviewNoteEntry>, AnalysisError> {
     let _span = tracing::info_span!("match_notes").entered();
 
     let notes = store.list_notes_summaries()?;
@@ -201,7 +212,7 @@ fn match_notes(store: &Store, changed_files: &HashSet<&str>) -> Result<Vec<NoteE
             if matching.is_empty() {
                 None
             } else {
-                Some(NoteEntry {
+                Some(ReviewNoteEntry {
                     text: note.text,
                     sentiment: note.sentiment,
                     matching_files: matching,
@@ -250,7 +261,7 @@ mod tests {
     fn mock_reviewed(name: &str, level: RiskLevel) -> ReviewedFunction {
         ReviewedFunction {
             name: name.to_string(),
-            file: "src/lib.rs".to_string(),
+            file: PathBuf::from("src/lib.rs"),
             line_start: 1,
             risk: RiskScore {
                 risk_level: level,

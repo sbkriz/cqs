@@ -19,7 +19,9 @@ pub fn pdf_to_markdown(path: &Path) -> Result<String> {
     let python = find_python()?;
 
     let output = std::process::Command::new(&python)
-        .args([&script, &path.to_string_lossy().to_string()])
+        .arg("--")
+        .arg(&script)
+        .arg(path)
         .output()
         .with_context(|| format!("Failed to run `{}`. Is Python installed?", python))?;
 
@@ -54,7 +56,6 @@ pub fn pdf_to_markdown(path: &Path) -> Result<String> {
 fn find_pdf_script() -> Result<String> {
     // Check env var first
     if let Ok(script) = std::env::var("CQS_PDF_SCRIPT") {
-        eprintln!("cqs: Using custom PDF script: {}", script);
         tracing::warn!(script = %script, "Using custom PDF script from CQS_PDF_SCRIPT env var");
         let p = PathBuf::from(&script);
         if p.extension().is_none_or(|e| e != "py") {

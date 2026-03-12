@@ -67,6 +67,8 @@ impl HnswIndex {
             DistCosine,
         );
 
+        // Test-only path: allocates the full Vec<Vec<f32>> double-buffer here.
+        // Production code uses `build_batched` to avoid this peak allocation.
         // Reconstruct Vec<f32> chunks from flat buffer for hnsw_rs API
         let chunks: Vec<Vec<f32>> = (0..nb_elem)
             .map(|i| {
@@ -152,6 +154,12 @@ impl HnswIndex {
                         expected: EMBEDDING_DIM,
                         actual: embedding.len(),
                     });
+                }
+                // Skip zero-vector embeddings — they produce NaN cosine distances
+                let norm_sq: f32 = embedding.as_vec().iter().map(|x| x * x).sum();
+                if norm_sq == 0.0 {
+                    tracing::warn!(chunk_id = %chunk_id, "Skipping zero-vector embedding");
+                    continue;
                 }
                 tracing::trace!("Adding {} to HNSW index", chunk_id);
                 id_map.push(chunk_id.clone());

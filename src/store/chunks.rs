@@ -42,10 +42,7 @@ impl Store {
         source_mtime: Option<i64>,
     ) -> Result<usize, StoreError> {
         let _span = tracing::info_span!("upsert_chunks_batch", count = chunks.len()).entered();
-        // 55 rows * 18 bind params = 990 < SQLite's 999 parameter limit
-        const CHUNK_INSERT_BATCH: usize = 55;
 
-        // Pre-compute embedding bytes outside async (embedding_to_bytes returns Result)
         let embedding_bytes: Vec<Vec<u8>> = chunks
             .iter()
             .map(|(_, emb)| embedding_to_bytes(emb))
@@ -53,102 +50,10 @@ impl Store {
 
         self.rt.block_on(async {
             let mut tx = self.pool.begin().await?;
-
-            // Batch-snapshot existing content hashes before INSERT overwrites them.
-            // Batched in groups of 500 to stay within SQLite's 999-param limit.
-            let mut old_hashes: HashMap<String, String> = HashMap::new();
-            {
-                const HASH_BATCH: usize = 500;
-                let chunk_ids: Vec<&str> = chunks.iter().map(|(c, _)| c.id.as_str()).collect();
-                for id_batch in chunk_ids.chunks(HASH_BATCH) {
-                    let placeholders: String = (1..=id_batch.len())
-                        .map(|i| format!("?{}", i))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let sql = format!(
-                        "SELECT id, content_hash FROM chunks WHERE id IN ({})",
-                        placeholders
-                    );
-                    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
-                    for id in id_batch {
-                        q = q.bind(*id);
-                    }
-                    let rows = q.fetch_all(&mut *tx).await?;
-                    for (id, hash) in rows {
-                        old_hashes.insert(id, hash);
-                    }
-                }
-            }
-
+            let old_hashes = snapshot_content_hashes(&mut tx, chunks).await?;
             let now = chrono::Utc::now().to_rfc3339();
-
-            // Batch INSERT chunks
-            for (batch_idx, batch) in chunks.chunks(CHUNK_INSERT_BATCH).enumerate() {
-                let emb_offset = batch_idx * CHUNK_INSERT_BATCH;
-                let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-                    "INSERT OR REPLACE INTO chunks (id, origin, source_type, language, chunk_type, name, signature, content, content_hash, doc, line_start, line_end, embedding, source_mtime, created_at, updated_at, parent_id, window_idx) ",
-                );
-                qb.push_values(
-                    batch.iter().enumerate(),
-                    |mut b, (i, (chunk, _))| {
-                        b.push_bind(&chunk.id)
-                            .push_bind(crate::normalize_path(&chunk.file))
-                            .push_bind("file")
-                            .push_bind(chunk.language.to_string())
-                            .push_bind(chunk.chunk_type.to_string())
-                            .push_bind(&chunk.name)
-                            .push_bind(&chunk.signature)
-                            .push_bind(&chunk.content)
-                            .push_bind(&chunk.content_hash)
-                            .push_bind(&chunk.doc)
-                            .push_bind(chunk.line_start as i64)
-                            .push_bind(chunk.line_end as i64)
-                            .push_bind(&embedding_bytes[emb_offset + i])
-                            .push_bind(source_mtime)
-                            .push_bind(&now)
-                            .push_bind(&now)
-                            .push_bind(&chunk.parent_id)
-                            .push_bind(chunk.window_idx.map(|i| i as i64));
-                    },
-                );
-                qb.build().execute(&mut *tx).await?;
-            }
-
-            // FTS per-row — skip if content_hash unchanged (compared to pre-INSERT snapshot)
-            for (chunk, _) in chunks {
-                let content_changed = old_hashes
-                    .get(&chunk.id)
-                    .map(|old_hash| old_hash != &chunk.content_hash)
-                    .unwrap_or(true);
-
-                if content_changed {
-                    let fts_name = normalize_for_fts(&chunk.name);
-                    let fts_sig = normalize_for_fts(&chunk.signature);
-                    let fts_content = normalize_for_fts(&chunk.content);
-                    let fts_doc = chunk
-                        .doc
-                        .as_ref()
-                        .map(|d| normalize_for_fts(d))
-                        .unwrap_or_default();
-
-                    sqlx::query("DELETE FROM chunks_fts WHERE id = ?1")
-                        .bind(&chunk.id)
-                        .execute(&mut *tx)
-                        .await?;
-
-                    sqlx::query(
-                        "INSERT INTO chunks_fts (id, name, signature, content, doc) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )
-                    .bind(&chunk.id)
-                    .bind(&fts_name)
-                    .bind(&fts_sig)
-                    .bind(&fts_content)
-                    .bind(&fts_doc)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-
+            batch_insert_chunks(&mut tx, chunks, &embedding_bytes, source_mtime, &now).await?;
+            upsert_fts_conditional(&mut tx, chunks, &old_hashes).await?;
             tx.commit().await?;
             Ok(chunks.len())
         })
@@ -336,9 +241,6 @@ impl Store {
         source_mtime: Option<i64>,
         calls: &[(String, crate::parser::CallSite)],
     ) -> Result<usize, StoreError> {
-        const CHUNK_INSERT_BATCH: usize = 55;
-
-        // Pre-compute embedding bytes (returns Result)
         let embedding_bytes: Vec<Vec<u8>> = chunks
             .iter()
             .map(|(_, emb)| embedding_to_bytes(emb))
@@ -346,100 +248,10 @@ impl Store {
 
         self.rt.block_on(async {
             let mut tx = self.pool.begin().await?;
-
-            // Batch-snapshot existing content hashes before INSERT overwrites them.
-            // Batched in groups of 500 to stay within SQLite's 999-param limit.
-            let mut old_hashes: HashMap<String, String> = HashMap::new();
-            {
-                const HASH_BATCH: usize = 500;
-                let chunk_ids: Vec<&str> = chunks.iter().map(|(c, _)| c.id.as_str()).collect();
-                for id_batch in chunk_ids.chunks(HASH_BATCH) {
-                    let placeholders: String = (1..=id_batch.len())
-                        .map(|i| format!("?{}", i))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let sql = format!(
-                        "SELECT id, content_hash FROM chunks WHERE id IN ({})",
-                        placeholders
-                    );
-                    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
-                    for id in id_batch {
-                        q = q.bind(*id);
-                    }
-                    let rows = q.fetch_all(&mut *tx).await?;
-                    for (id, hash) in rows {
-                        old_hashes.insert(id, hash);
-                    }
-                }
-            }
-
-            // Batch INSERT chunks
+            let old_hashes = snapshot_content_hashes(&mut tx, chunks).await?;
             let now = chrono::Utc::now().to_rfc3339();
-            for (batch_idx, batch) in chunks.chunks(CHUNK_INSERT_BATCH).enumerate() {
-                let emb_offset = batch_idx * CHUNK_INSERT_BATCH;
-                let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-                    "INSERT OR REPLACE INTO chunks (id, origin, source_type, language, chunk_type, name, signature, content, content_hash, doc, line_start, line_end, embedding, source_mtime, created_at, updated_at, parent_id, window_idx) ",
-                );
-                qb.push_values(
-                    batch.iter().enumerate(),
-                    |mut b, (i, (chunk, _))| {
-                        b.push_bind(&chunk.id)
-                            .push_bind(crate::normalize_path(&chunk.file))
-                            .push_bind("file")
-                            .push_bind(chunk.language.to_string())
-                            .push_bind(chunk.chunk_type.to_string())
-                            .push_bind(&chunk.name)
-                            .push_bind(&chunk.signature)
-                            .push_bind(&chunk.content)
-                            .push_bind(&chunk.content_hash)
-                            .push_bind(&chunk.doc)
-                            .push_bind(chunk.line_start as i64)
-                            .push_bind(chunk.line_end as i64)
-                            .push_bind(&embedding_bytes[emb_offset + i])
-                            .push_bind(source_mtime)
-                            .push_bind(&now)
-                            .push_bind(&now)
-                            .push_bind(&chunk.parent_id)
-                            .push_bind(chunk.window_idx.map(|i| i as i64));
-                    },
-                );
-                qb.build().execute(&mut *tx).await?;
-            }
-
-            // FTS per-row — skip if content_hash unchanged (compared to pre-INSERT snapshot)
-            for (chunk, _) in chunks {
-                let content_changed = old_hashes
-                    .get(&chunk.id)
-                    .map(|old_hash| old_hash != &chunk.content_hash)
-                    .unwrap_or(true);
-
-                if content_changed {
-                    let fts_name = normalize_for_fts(&chunk.name);
-                    let fts_sig = normalize_for_fts(&chunk.signature);
-                    let fts_content = normalize_for_fts(&chunk.content);
-                    let fts_doc = chunk
-                        .doc
-                        .as_ref()
-                        .map(|d| normalize_for_fts(d))
-                        .unwrap_or_default();
-
-                    sqlx::query("DELETE FROM chunks_fts WHERE id = ?1")
-                        .bind(&chunk.id)
-                        .execute(&mut *tx)
-                        .await?;
-
-                    sqlx::query(
-                        "INSERT INTO chunks_fts (id, name, signature, content, doc) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )
-                    .bind(&chunk.id)
-                    .bind(&fts_name)
-                    .bind(&fts_sig)
-                    .bind(&fts_content)
-                    .bind(&fts_doc)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
+            batch_insert_chunks(&mut tx, chunks, &embedding_bytes, source_mtime, &now).await?;
+            upsert_fts_conditional(&mut tx, chunks, &old_hashes).await?;
 
             // Upsert calls: delete old calls for these chunk IDs, insert new ones
             if !calls.is_empty() {
@@ -453,7 +265,6 @@ impl Store {
                     }
                 }
 
-                // 300 rows * 3 binds = 900 < SQLite's 999 limit
                 const INSERT_BATCH: usize = 300;
                 for batch in calls.chunks(INSERT_BATCH) {
                     let mut query_builder: sqlx::QueryBuilder<sqlx::Sqlite> =
@@ -511,9 +322,7 @@ impl Store {
             let mut tx = self.pool.begin().await?;
 
             for batch in missing.chunks(BATCH_SIZE) {
-                let placeholders: Vec<String> =
-                    (1..=batch.len()).map(|i| format!("?{}", i)).collect();
-                let placeholder_str = placeholders.join(",");
+                let placeholder_str = super::helpers::make_placeholders(batch.len());
 
                 // Delete from FTS first
                 let fts_query = format!(
@@ -652,10 +461,7 @@ impl Store {
             // Batch in groups of 900 to stay under SQLite's 999-parameter limit
             const BATCH_SIZE: usize = 900;
             for batch in origins.chunks(BATCH_SIZE) {
-                let placeholders: String = (1..=batch.len())
-                    .map(|i| format!("?{}", i))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let placeholders = super::helpers::make_placeholders(batch.len());
                 let sql = format!(
                     "SELECT origin, source_mtime FROM chunks WHERE origin IN ({}) GROUP BY origin",
                     placeholders
@@ -741,10 +547,7 @@ impl Store {
 
         self.rt.block_on(async {
             for batch in hashes.chunks(BATCH_SIZE) {
-                let placeholders: String = (1..=batch.len())
-                    .map(|i| format!("?{}", i))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let placeholders = super::helpers::make_placeholders(batch.len());
                 let sql = format!(
                     "SELECT content_hash, embedding FROM chunks WHERE content_hash IN ({})",
                     placeholders
@@ -794,10 +597,7 @@ impl Store {
 
         self.rt.block_on(async {
             for batch in hashes.chunks(BATCH_SIZE) {
-                let placeholders: String = (1..=batch.len())
-                    .map(|i| format!("?{}", i))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let placeholders = super::helpers::make_placeholders(batch.len());
                 let sql = format!(
                     "SELECT id, embedding FROM chunks WHERE content_hash IN ({})",
                     placeholders
@@ -975,14 +775,13 @@ impl Store {
 
             const BATCH_SIZE: usize = 500;
             for batch in origins.chunks(BATCH_SIZE) {
-                let placeholders: Vec<String> =
-                    (1..=batch.len()).map(|i| format!("?{}", i)).collect();
+                let placeholders = super::helpers::make_placeholders(batch.len());
                 let sql = format!(
                     "SELECT id, origin, language, chunk_type, name, signature, content, doc,
                             line_start, line_end, parent_id
                      FROM chunks WHERE origin IN ({})
                      ORDER BY origin, line_start",
-                    placeholders.join(", ")
+                    placeholders
                 );
 
                 let mut query = sqlx::query(&sql);
@@ -1022,10 +821,7 @@ impl Store {
 
             const BATCH_SIZE: usize = 500;
             for batch in names.chunks(BATCH_SIZE) {
-                let placeholders: String = (1..=batch.len())
-                    .map(|i| format!("?{}", i))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let placeholders = super::helpers::make_placeholders(batch.len());
                 let sql = format!(
                     "SELECT id, origin, language, chunk_type, name, signature, content, doc,
                             line_start, line_end, parent_id
@@ -1118,10 +914,7 @@ impl Store {
 
         self.rt.block_on(async {
             for batch in ids.chunks(BATCH_SIZE) {
-                let placeholders: String = (1..=batch.len())
-                    .map(|i| format!("?{}", i))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let placeholders = super::helpers::make_placeholders(batch.len());
                 let sql = format!(
                     "SELECT id, embedding FROM chunks WHERE id IN ({})",
                     placeholders
@@ -1185,12 +978,15 @@ impl Store {
                 // queries are safe even without normalize_for_fts().
                 let fts_terms: Vec<String> = batch
                     .iter()
-                    .map(|(_, norm)| {
-                        assert!(
+                    .filter_map(|(_, norm)| {
+                        debug_assert!(
                             !norm.contains('"'),
                             "sanitized query must not contain double quotes"
                         );
-                        format!("name:\"{}\" OR name:\"{}\"*", norm, norm)
+                        if norm.contains('"') {
+                            return None;
+                        }
+                        Some(format!("name:\"{}\" OR name:\"{}\"*", norm, norm))
                     })
                     .collect();
                 let combined_fts = fts_terms.join(" OR ");
@@ -1210,7 +1006,10 @@ impl Store {
                 .fetch_all(&self.pool)
                 .await?;
 
-                // Post-filter: assign each row to matching names
+                // Post-filter: assign each row to matching names.
+                // Complexity: O(results × batch.len()), but batch.len() ≤ BATCH_SIZE = 20
+                // and score_name_match does fuzzy substring/prefix scoring, so a HashMap
+                // on exact name is not applicable here. The bound is acceptable.
                 for row in rows {
                     let chunk = ChunkSummary::from(ChunkRow::from_row(&row));
 
@@ -1317,10 +1116,7 @@ impl Store {
         let mut result = HashMap::with_capacity(ids.len());
 
         for batch in ids.chunks(BATCH_SIZE) {
-            let placeholders: String = (1..=batch.len())
-                .map(|i| format!("?{}", i))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = super::helpers::make_placeholders(batch.len());
             let sql = format!(
                 "SELECT id, origin, language, chunk_type, name, signature, content, doc, line_start, line_end, parent_id
                  FROM chunks WHERE id IN ({})",
@@ -1362,10 +1158,7 @@ impl Store {
         let mut result = Vec::with_capacity(ids.len());
 
         for batch in ids.chunks(BATCH_SIZE) {
-            let placeholders: String = (1..=batch.len())
-                .map(|i| format!("?{}", i))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = super::helpers::make_placeholders(batch.len());
             let sql = format!(
                 "SELECT id, name, origin, language, chunk_type, embedding
                  FROM chunks WHERE id IN ({})",
@@ -1402,10 +1195,7 @@ impl Store {
             return Ok(vec![]);
         }
 
-        let placeholders: String = (1..=ids.len())
-            .map(|i| format!("?{}", i))
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = super::helpers::make_placeholders(ids.len());
         let sql = format!(
             "SELECT id, origin, language, chunk_type, name, signature, content, doc, line_start, line_end, parent_id, embedding
              FROM chunks WHERE id IN ({})",
@@ -1459,6 +1249,116 @@ impl Store {
             done: false,
         }
     }
+}
+
+// ── Shared async helpers for chunk upsert (PERF-3) ──────────────────────────
+
+/// Snapshot existing content hashes before INSERT overwrites them.
+/// Batched in groups of 500 to stay within SQLite's 999-param limit.
+async fn snapshot_content_hashes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    chunks: &[(Chunk, Embedding)],
+) -> Result<HashMap<String, String>, StoreError> {
+    const HASH_BATCH: usize = 500;
+    let mut old_hashes = HashMap::new();
+    let chunk_ids: Vec<&str> = chunks.iter().map(|(c, _)| c.id.as_str()).collect();
+    for id_batch in chunk_ids.chunks(HASH_BATCH) {
+        let placeholders = super::helpers::make_placeholders(id_batch.len());
+        let sql = format!(
+            "SELECT id, content_hash FROM chunks WHERE id IN ({})",
+            placeholders
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for id in id_batch {
+            q = q.bind(*id);
+        }
+        let rows = q.fetch_all(&mut **tx).await?;
+        for (id, hash) in rows {
+            old_hashes.insert(id, hash);
+        }
+    }
+    Ok(old_hashes)
+}
+
+/// Batch INSERT chunks (55 rows × 18 params = 990 < SQLite's 999 limit).
+async fn batch_insert_chunks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    chunks: &[(Chunk, Embedding)],
+    embedding_bytes: &[Vec<u8>],
+    source_mtime: Option<i64>,
+    now: &str,
+) -> Result<(), StoreError> {
+    const CHUNK_INSERT_BATCH: usize = 55;
+    for (batch_idx, batch) in chunks.chunks(CHUNK_INSERT_BATCH).enumerate() {
+        let emb_offset = batch_idx * CHUNK_INSERT_BATCH;
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "INSERT OR REPLACE INTO chunks (id, origin, source_type, language, chunk_type, name, signature, content, content_hash, doc, line_start, line_end, embedding, source_mtime, created_at, updated_at, parent_id, window_idx) ",
+        );
+        qb.push_values(batch.iter().enumerate(), |mut b, (i, (chunk, _))| {
+            b.push_bind(&chunk.id)
+                .push_bind(crate::normalize_path(&chunk.file))
+                .push_bind("file")
+                .push_bind(chunk.language.to_string())
+                .push_bind(chunk.chunk_type.to_string())
+                .push_bind(&chunk.name)
+                .push_bind(&chunk.signature)
+                .push_bind(&chunk.content)
+                .push_bind(&chunk.content_hash)
+                .push_bind(&chunk.doc)
+                .push_bind(chunk.line_start as i64)
+                .push_bind(chunk.line_end as i64)
+                .push_bind(&embedding_bytes[emb_offset + i])
+                .push_bind(source_mtime)
+                .push_bind(now)
+                .push_bind(now)
+                .push_bind(&chunk.parent_id)
+                .push_bind(chunk.window_idx.map(|i| i as i64));
+        });
+        qb.build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// Conditional FTS upsert: skip if content_hash unchanged (compared to pre-INSERT snapshot).
+async fn upsert_fts_conditional(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    chunks: &[(Chunk, Embedding)],
+    old_hashes: &HashMap<String, String>,
+) -> Result<(), StoreError> {
+    for (chunk, _) in chunks {
+        let content_changed = old_hashes
+            .get(&chunk.id)
+            .map(|old_hash| old_hash != &chunk.content_hash)
+            .unwrap_or(true);
+
+        if content_changed {
+            let fts_name = normalize_for_fts(&chunk.name);
+            let fts_sig = normalize_for_fts(&chunk.signature);
+            let fts_content = normalize_for_fts(&chunk.content);
+            let fts_doc = chunk
+                .doc
+                .as_ref()
+                .map(|d| normalize_for_fts(d))
+                .unwrap_or_default();
+
+            sqlx::query("DELETE FROM chunks_fts WHERE id = ?1")
+                .bind(&chunk.id)
+                .execute(&mut **tx)
+                .await?;
+
+            sqlx::query(
+                "INSERT INTO chunks_fts (id, name, signature, content, doc) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(&chunk.id)
+            .bind(&fts_name)
+            .bind(&fts_sig)
+            .bind(&fts_content)
+            .bind(&fts_doc)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Iterator for streaming embeddings in batches using cursor-based pagination

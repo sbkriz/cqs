@@ -63,7 +63,14 @@ pub fn cmd_watch(cli: &Cli, debounce_ms: u64, no_ignore: bool, poll: bool) -> Re
 
     let root = find_project_root();
 
-    // Auto-detect when polling is needed: WSL + /mnt/ path
+    // Auto-detect when polling is needed: WSL + /mnt/ path.
+    //
+    // Detection is prefix-based (/mnt/) rather than filesystem-based (statfs NTFS/FAT magic)
+    // because that's pragmatic: paths under /mnt/ in WSL are DrvFs mounts of Windows
+    // filesystems (NTFS, FAT32, exFAT), none of which support inotify. A statfs check would
+    // give the same answer with more syscalls and less portability across WSL versions.
+    // If the project root is on a Linux filesystem inside WSL (e.g. /home/...), inotify works
+    // fine and we leave use_poll false.
     let use_poll =
         poll || (cqs::config::is_wsl() && root.to_str().is_some_and(|p| p.starts_with("/mnt/")));
 
@@ -305,6 +312,7 @@ fn process_file_changes(
     quiet: bool,
 ) {
     let files: Vec<PathBuf> = pending_files.drain().collect();
+    let _span = info_span!("process_file_changes", file_count = files.len()).entered();
     pending_files.shrink_to(64);
     if !quiet {
         println!("\n{} file(s) changed, reindexing...", files.len());
@@ -355,6 +363,9 @@ fn process_file_changes(
             let needs_full_rebuild =
                 hnsw_index.is_none() || *incremental_count >= HNSW_REBUILD_THRESHOLD;
 
+            // During full rebuild the old index and new batch coexist briefly,
+            // but `build_batched` streams one batch at a time so peak memory is
+            // old_index + one_batch, not 2× the full index.
             if needs_full_rebuild {
                 match super::commands::build_hnsw_index_owned(store, cqs_dir) {
                     Ok(Some(index)) => {
@@ -497,7 +508,7 @@ fn reindex_files(
                     file_chunks
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to parse {}: {}", abs_path.display(), e);
+                    tracing::warn!(path = %abs_path.display(), error = %e, "Failed to parse file");
                     vec![]
                 }
             }
@@ -593,6 +604,8 @@ fn reindex_files(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
         });
+        // `all_calls` is scoped to the changed files in this reindex batch, not the full
+        // index, so this filter is O(changed_chunks) rather than O(all_chunks).
         // Filter calls to only those belonging to chunks in this file
         let chunk_ids: HashSet<&str> = pairs.iter().map(|(c, _)| c.id.as_str()).collect();
         let file_calls: Vec<_> = all_calls

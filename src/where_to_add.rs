@@ -58,6 +58,7 @@ impl FileSuggestion {
             "insertion_line": self.insertion_line,
             "near_function": self.near_function,
             "reason": self.reason,
+            "patterns": self.patterns,
         })
     }
 }
@@ -116,23 +117,6 @@ pub fn suggest_placement(
         limit,
         &PlacementOptions::default(),
     )
-}
-
-/// Suggest where to place new code using a pre-computed embedding.
-///
-/// Avoids redundant ONNX inference when the caller already embedded the query
-/// (e.g., `task()` embeds once and reuses across phases).
-pub fn suggest_placement_with_embedding(
-    store: &Store,
-    query_embedding: &crate::Embedding,
-    description: &str,
-    limit: usize,
-) -> Result<PlacementResult, AnalysisError> {
-    let opts = PlacementOptions {
-        query_embedding: Some(query_embedding.clone()),
-        ..Default::default()
-    };
-    suggest_placement_with_options_core(store, description, limit, &opts)
 }
 
 /// Suggest where to place new code matching a description with configurable search parameters.

@@ -1,8 +1,10 @@
 //! Diff-aware impact analysis
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::store::CallerWithContext;
+use crate::AnalysisError;
 use crate::Store;
 
 use super::analysis::extract_call_snippet_from_cache;
@@ -27,17 +29,17 @@ pub fn map_hunks_to_functions(
     let mut functions = Vec::new();
 
     // Group hunks by file
-    let mut by_file: HashMap<&str, Vec<&crate::diff_parse::DiffHunk>> = HashMap::new();
+    let mut by_file: HashMap<&Path, Vec<&crate::diff_parse::DiffHunk>> = HashMap::new();
     for hunk in hunks {
         by_file.entry(&hunk.file).or_default().push(hunk);
     }
 
     for (file, file_hunks) in &by_file {
-        let normalized = normalize_slashes(file);
+        let normalized = normalize_slashes(&file.to_string_lossy());
         let chunks = match store.get_chunks_by_origin(&normalized) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(file = %file, error = %e, "Failed to get chunks for file");
+                tracing::warn!(file = %file.display(), error = %e, "Failed to get chunks for file");
                 continue;
             }
         };
@@ -55,7 +57,7 @@ pub fn map_hunks_to_functions(
                 {
                     functions.push(ChangedFunction {
                         name: chunk.name.clone(),
-                        file: file.to_string(),
+                        file: file.to_path_buf(),
                         line_start: chunk.line_start,
                     });
                 }
@@ -73,7 +75,7 @@ pub fn map_hunks_to_functions(
 pub fn analyze_diff_impact(
     store: &Store,
     changed: Vec<ChangedFunction>,
-) -> anyhow::Result<DiffImpactResult> {
+) -> Result<DiffImpactResult, AnalysisError> {
     let graph = store.get_call_graph()?;
     let test_chunks = store.find_test_chunks()?;
     analyze_diff_impact_with_graph(store, changed, &graph, &test_chunks)
@@ -88,7 +90,7 @@ pub fn analyze_diff_impact_with_graph(
     changed: Vec<ChangedFunction>,
     graph: &crate::store::CallGraph,
     test_chunks: &[crate::store::ChunkSummary],
-) -> anyhow::Result<DiffImpactResult> {
+) -> Result<DiffImpactResult, AnalysisError> {
     let _span = tracing::info_span!("analyze_diff_impact", changed_count = changed.len()).entered();
     if changed.is_empty() {
         return Ok(DiffImpactResult {
