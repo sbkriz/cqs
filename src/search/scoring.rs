@@ -1,110 +1,48 @@
-//! Search algorithms and name matching
+//! Scoring algorithms, name matching, and search helpers.
 //!
-//! Implements search methods on Store for semantic, hybrid, and index-guided
-//! search. See `math.rs` for similarity scoring.
+//! Contains `NameMatcher`, `NoteBoostIndex`, `BoundedScoreHeap`, `FilterSql`,
+//! and all scoring/filtering functions used by the search pipeline.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use sqlx::Row;
-
-use crate::embedder::Embedding;
-use crate::index::VectorIndex;
 use crate::language::ChunkType;
 use crate::math::cosine_similarity;
-use crate::nl::normalize_for_fts;
 use crate::nl::tokenize_identifier;
 use crate::note::path_matches_mention;
-use crate::store::helpers::{
-    embedding_slice, CandidateRow, ChunkSummary, NoteSummary, SearchFilter, SearchResult,
-};
-use crate::store::sanitize_fts_query;
-use crate::store::{Store, StoreError};
+use crate::store::helpers::{NoteSummary, SearchFilter, SearchResult};
 
-/// Result of resolving a target name to a concrete chunk.
+// ============ Scoring Configuration ============
+
+/// Central configuration for all search scoring constants.
 ///
-/// Contains the best-matching chunk and any alternative matches
-/// found during resolution (useful for disambiguation UIs).
-#[derive(Debug, Clone)]
-pub struct ResolvedTarget {
-    /// The resolved chunk (best match for the target name)
-    pub chunk: ChunkSummary,
-    /// Other candidates found during resolution, ordered by match quality
-    pub alternatives: Vec<SearchResult>,
+/// Consolidates name matching tiers, note boost factor, importance
+/// demotion weights, and parent boost parameters into one struct.
+/// Use `ScoringConfig::DEFAULT` everywhere — no scattered magic numbers.
+pub(crate) struct ScoringConfig {
+    pub name_exact: f32,
+    pub name_contains: f32,
+    pub name_contained_by: f32,
+    pub name_max_overlap: f32,
+    pub note_boost_factor: f32,
+    pub importance_test: f32,
+    pub importance_private: f32,
+    pub parent_boost_per_child: f32,
+    pub parent_boost_cap: f32,
 }
 
-// ============ Target Resolution ============
-
-/// Parse a target string into (optional_file_filter, function_name).
-///
-/// Supports formats:
-/// - `"function_name"` -> (None, "function_name")
-/// - `"path/to/file.rs:function_name"` -> (Some("path/to/file.rs"), "function_name")
-pub fn parse_target(target: &str) -> (Option<&str>, &str) {
-    if let Some(pos) = target.rfind(':') {
-        let file = &target[..pos];
-        let name = &target[pos + 1..];
-        if !file.is_empty() && !name.is_empty() {
-            return (Some(file), name);
-        }
-    }
-    (None, target.trim_end_matches(':'))
-}
-
-/// Resolve a target string to a [`ResolvedTarget`].
-///
-/// Uses search_by_name with optional file filtering.
-/// Returns the best-matching chunk and alternatives, or an error if none found.
-pub fn resolve_target(store: &Store, target: &str) -> Result<ResolvedTarget, StoreError> {
-    let _span = tracing::info_span!("resolve_target", target).entered();
-    let (file_filter, name) = parse_target(target);
-    let results = store.search_by_name(name, 20)?;
-    if results.is_empty() {
-        return Err(StoreError::NotFound(format!(
-            "No function found matching '{}'. Check the name and try again.",
-            name
-        )));
-    }
-
-    let idx = if let Some(file) = file_filter {
-        let matched = results.iter().position(|r| {
-            let path = r.chunk.file.to_string_lossy();
-            path.ends_with(file) || path.contains(file)
-        });
-        match matched {
-            Some(i) => i,
-            None => {
-                let found_in: Vec<_> = results
-                    .iter()
-                    .take(3)
-                    .map(|r| r.chunk.file.to_string_lossy().to_string())
-                    .collect();
-                return Err(StoreError::NotFound(format!(
-                    "No function '{}' found in file matching '{}'. Found in: {}",
-                    name,
-                    file,
-                    found_in.join(", ")
-                )));
-            }
-        }
-    } else {
-        // Prefer non-test chunks when names are ambiguous
-        results
-            .iter()
-            .position(|r| {
-                let path = r.chunk.file.to_string_lossy();
-                let name = &r.chunk.name;
-                !name.starts_with("test_")
-                    && !path.contains("/tests/")
-                    && !path.ends_with("_test.rs")
-            })
-            .unwrap_or(0)
+impl ScoringConfig {
+    pub const DEFAULT: Self = Self {
+        name_exact: 1.0,
+        name_contains: 0.8,
+        name_contained_by: 0.6,
+        name_max_overlap: 0.5,
+        note_boost_factor: 0.15,
+        importance_test: 0.70,
+        importance_private: 0.80,
+        parent_boost_per_child: 0.05,
+        parent_boost_cap: 1.15,
     };
-    let chunk = results[idx].chunk.clone();
-    Ok(ResolvedTarget {
-        chunk,
-        alternatives: results,
-    })
 }
 
 // ============ Name Matching ============
@@ -117,7 +55,7 @@ pub fn resolve_target(store: &Store, target: &str) -> Result<ResolvedTarget, Sto
 /// Used to gate name_boost — boosting by name similarity is harmful for
 /// NL queries because it rewards coincidental substring matches over
 /// semantic relevance.
-fn is_name_like_query(query: &str) -> bool {
+pub(crate) fn is_name_like_query(query: &str) -> bool {
     let words: Vec<&str> = query.split_whitespace().collect();
     // Single token or two-token queries are likely identifiers
     if words.len() <= 2 {
@@ -194,29 +132,24 @@ impl NameMatcher {
         }
     }
 
-    // Name match score tiers
-    const SCORE_EXACT: f32 = 1.0;
-    const SCORE_CONTAINS: f32 = 0.8;
-    const SCORE_CONTAINED_BY: f32 = 0.6;
-    const SCORE_MAX_OVERLAP: f32 = 0.5;
-
     /// Compute name match score against pre-tokenized query
     pub fn score(&self, name: &str) -> f32 {
+        let cfg = &ScoringConfig::DEFAULT;
         let name_lower = name.to_lowercase();
 
         // Exact match
         if name_lower == self.query_lower {
-            return Self::SCORE_EXACT;
+            return cfg.name_exact;
         }
 
         // Name contains query as substring
         if name_lower.contains(&self.query_lower) {
-            return Self::SCORE_CONTAINS;
+            return cfg.name_contains;
         }
 
         // Query contains name as substring
         if self.query_lower.contains(&name_lower) {
-            return Self::SCORE_CONTAINED_BY;
+            return cfg.name_contained_by;
         }
 
         // Word overlap scoring
@@ -267,7 +200,7 @@ impl NameMatcher {
             .count() as f32;
         let total = self.query_words.len().max(1) as f32;
 
-        (overlap / total) * Self::SCORE_MAX_OVERLAP
+        (overlap / total) * cfg.name_max_overlap
     }
 }
 
@@ -279,7 +212,7 @@ impl NameMatcher {
 /// The hash_prefix is always 8 hex chars. Windowed chunk IDs append `:wN` where
 /// N is a small integer (0-99). We detect windowed IDs by checking if the last
 /// segment starts with 'w' followed by digits.
-fn extract_file_from_chunk_id(id: &str) -> &str {
+pub(crate) fn extract_file_from_chunk_id(id: &str) -> &str {
     // Strip last segment
     let Some(last_colon) = id.rfind(':') else {
         return id;
@@ -314,7 +247,7 @@ fn extract_file_from_chunk_id(id: &str) -> &str {
 /// Compile a glob pattern into a matcher, logging and ignoring invalid patterns.
 ///
 /// Returns `None` if the pattern is `None` or invalid (with a warning logged).
-fn compile_glob_filter(pattern: Option<&String>) -> Option<globset::GlobMatcher> {
+pub(crate) fn compile_glob_filter(pattern: Option<&String>) -> Option<globset::GlobMatcher> {
     pattern.and_then(|p| match globset::Glob::new(p) {
         Ok(g) => Some(g.compile_matcher()),
         Err(e) => {
@@ -332,19 +265,13 @@ pub(crate) fn name_match_score(query: &str, name: &str) -> f32 {
     NameMatcher::new(query).score(name)
 }
 
-/// Multiplicative boost factor for note-matched code chunks.
-///
-/// A note with sentiment +1 boosts the chunk's score by 15%.
-/// A note with sentiment -1 reduces it by 15%.
-const NOTE_BOOST_FACTOR: f32 = 0.15;
-
 /// Compute the note-based score boost for a chunk.
 ///
 /// Checks if any note's mentions match the chunk's file path or name.
 /// When multiple notes match, takes the strongest absolute sentiment
 /// (preserving sign) to avoid averaging away strong signals.
 ///
-/// Returns a multiplier: `1.0 + sentiment * NOTE_BOOST_FACTOR`
+/// Returns a multiplier: `1.0 + sentiment * ScoringConfig::DEFAULT.note_boost_factor`
 ///
 /// Production code uses [`NoteBoostIndex::boost`] for amortized O(1) lookups.
 /// This function is retained for unit tests.
@@ -368,7 +295,7 @@ fn note_boost(file_path: &str, chunk_name: &str, notes: &[NoteSummary]) -> f32 {
         }
     }
     match strongest {
-        Some(s) => 1.0 + s * NOTE_BOOST_FACTOR,
+        Some(s) => 1.0 + s * ScoringConfig::DEFAULT.note_boost_factor,
         None => 1.0,
     }
 }
@@ -379,16 +306,22 @@ fn note_boost(file_path: &str, chunk_name: &str, notes: &[NoteSummary]) -> f32 {
 /// cost across all chunks. Name mentions use exact HashMap lookup (O(1)).
 /// Path mentions are stored separately for suffix/prefix matching, but with only
 /// the path-type mentions instead of all mentions.
-struct NoteBoostIndex<'a> {
+pub(crate) struct NoteBoostIndex<'a> {
     /// Exact name -> strongest sentiment (absolute value wins, preserving sign)
+    #[cfg(test)]
+    pub(super) name_sentiments: HashMap<&'a str, f32>,
+    #[cfg(not(test))]
     name_sentiments: HashMap<&'a str, f32>,
     /// (mention_str, sentiment) pairs for path-based mentions
+    #[cfg(test)]
+    pub(super) path_mentions: Vec<(&'a str, f32)>,
+    #[cfg(not(test))]
     path_mentions: Vec<(&'a str, f32)>,
 }
 
 impl<'a> NoteBoostIndex<'a> {
     /// Build the lookup index from notes. O(notes x mentions), done once.
-    fn new(notes: &'a [NoteSummary]) -> Self {
+    pub fn new(notes: &'a [NoteSummary]) -> Self {
         let mut name_sentiments: HashMap<&'a str, f32> = HashMap::new();
         let mut path_mentions: Vec<(&'a str, f32)> = Vec::new();
 
@@ -421,9 +354,9 @@ impl<'a> NoteBoostIndex<'a> {
     /// for suffix/prefix matches. Takes strongest absolute sentiment across all
     /// matches (preserving sign).
     ///
-    /// Returns a multiplier: `1.0 + sentiment * NOTE_BOOST_FACTOR`
+    /// Returns a multiplier: `1.0 + sentiment * note_boost_factor`
     #[inline]
-    fn boost(&self, file_path: &str, chunk_name: &str) -> f32 {
+    pub fn boost(&self, file_path: &str, chunk_name: &str) -> f32 {
         let mut strongest: Option<f32> = None;
 
         // O(1) name lookup
@@ -447,7 +380,7 @@ impl<'a> NoteBoostIndex<'a> {
         }
 
         match strongest {
-            Some(s) => 1.0 + s * NOTE_BOOST_FACTOR,
+            Some(s) => 1.0 + s * ScoringConfig::DEFAULT.note_boost_factor,
             None => 1.0,
         }
     }
@@ -465,16 +398,14 @@ impl<'a> NoteBoostIndex<'a> {
 /// | Underscore-prefixed      | name starts with `_` (not `__`)     | 0.80       |
 ///
 /// Returns 1.0 (no change) when demotion doesn't apply.
-const IMPORTANCE_TEST: f32 = 0.70;
-const IMPORTANCE_PRIVATE: f32 = 0.80;
-
-fn chunk_importance(name: &str, file_path: &str) -> f32 {
+pub(crate) fn chunk_importance(name: &str, file_path: &str) -> f32 {
+    let cfg = &ScoringConfig::DEFAULT;
     if crate::is_test_chunk(name, file_path) {
-        return IMPORTANCE_TEST;
+        return cfg.importance_test;
     }
     // Underscore-prefixed private (but not dunder like __init__)
     if name.starts_with('_') && !name.starts_with("__") {
-        return IMPORTANCE_PRIVATE;
+        return cfg.importance_private;
     }
     1.0
 }
@@ -490,11 +421,11 @@ fn chunk_importance(name: &str, file_path: &str) -> f32 {
 /// Algorithm: count how many results have `parent_type_name == X`. If a
 /// Class/Struct/Interface chunk named `X` also appears in results, boost it.
 ///
-/// Boost magnitude: `1.0 + 0.05 × (child_count - 1)`, capped at 1.15.
+/// Boost magnitude: `1.0 + parent_boost_per_child × (child_count - 1)`, capped at `parent_boost_cap`.
 /// With 2 children → 1.05×, 3 → 1.10×, 4+ → 1.15×.
 ///
 /// Re-sorts results by score after boosting.
-fn apply_parent_boost(results: &mut [SearchResult]) {
+pub(crate) fn apply_parent_boost(results: &mut [SearchResult]) {
     if results.len() < 3 {
         return; // Need at least a container + 2 children
     }
@@ -512,6 +443,8 @@ fn apply_parent_boost(results: &mut [SearchResult]) {
         return;
     }
 
+    let cfg = &ScoringConfig::DEFAULT;
+    let max_children = (cfg.parent_boost_cap - 1.0) / cfg.parent_boost_per_child;
     let mut boosted = false;
     for r in results.iter_mut() {
         let is_container = matches!(
@@ -523,7 +456,8 @@ fn apply_parent_boost(results: &mut [SearchResult]) {
         }
         if let Some(&count) = parent_counts.get(&r.chunk.name) {
             if count >= 2 {
-                let boost = 1.0 + 0.05 * (count as f32 - 1.0).min(3.0);
+                let boost =
+                    1.0 + cfg.parent_boost_per_child * (count as f32 - 1.0).min(max_children);
                 tracing::debug!(
                     name = %r.chunk.name,
                     child_count = count,
@@ -546,7 +480,7 @@ fn apply_parent_boost(results: &mut [SearchResult]) {
 /// Uses a min-heap internally so the smallest score is always at the top,
 /// allowing O(log N) eviction when the heap is full. This bounds memory to
 /// O(limit) instead of O(total_chunks) for the scoring phase.
-struct BoundedScoreHeap {
+pub(crate) struct BoundedScoreHeap {
     heap: BinaryHeap<Reverse<(OrderedFloat, String)>>,
     capacity: usize,
 }
@@ -571,7 +505,7 @@ impl Ord for OrderedFloat {
 }
 
 impl BoundedScoreHeap {
-    fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             heap: BinaryHeap::with_capacity(capacity + 1),
             capacity,
@@ -579,7 +513,7 @@ impl BoundedScoreHeap {
     }
 
     /// Push a scored result. If at capacity, evicts the lowest score.
-    fn push(&mut self, id: String, score: f32) {
+    pub fn push(&mut self, id: String, score: f32) {
         if !score.is_finite() {
             tracing::warn!("BoundedScoreHeap: ignoring non-finite score");
             return;
@@ -604,7 +538,7 @@ impl BoundedScoreHeap {
     }
 
     /// Drain into a sorted Vec (highest score first).
-    fn into_sorted_vec(self) -> Vec<(String, f32)> {
+    pub fn into_sorted_vec(self) -> Vec<(String, f32)> {
         let mut results: Vec<_> = self
             .heap
             .into_iter()
@@ -619,17 +553,17 @@ impl BoundedScoreHeap {
 ///
 /// Separates filter analysis (testable without a database) from SQL execution.
 /// The caller combines these pieces with cursor-specific clauses (rowid, LIMIT).
-struct FilterSql {
+pub(crate) struct FilterSql {
     /// SQL WHERE conditions (e.g., `"language IN (?1,?2)"`)
-    conditions: Vec<String>,
+    pub conditions: Vec<String>,
     /// Bind values corresponding to the placeholders in `conditions`, in order
-    bind_values: Vec<String>,
+    pub bind_values: Vec<String>,
     /// Column list for SELECT (includes `name` when hybrid scoring or demotion is needed)
-    columns: &'static str,
+    pub columns: &'static str,
     /// Whether hybrid name+embedding scoring is active
-    use_hybrid: bool,
+    pub use_hybrid: bool,
     /// Whether RRF fusion with FTS keyword search is active
-    use_rrf: bool,
+    pub use_rrf: bool,
 }
 
 /// Build SQL filter components from a [`SearchFilter`].
@@ -637,7 +571,7 @@ struct FilterSql {
 /// Pure function — no database access. Returns conditions, bind values, and
 /// the column list needed for the scoring loop. Bind parameter indices are
 /// 1-based and contiguous.
-fn build_filter_sql(filter: &SearchFilter) -> FilterSql {
+pub(crate) fn build_filter_sql(filter: &SearchFilter) -> FilterSql {
     let mut conditions = Vec::new();
     let mut bind_values: Vec<String> = Vec::new();
 
@@ -691,7 +625,7 @@ fn build_filter_sql(filter: &SearchFilter) -> FilterSql {
 ///
 /// Returns `None` if the candidate is filtered out (glob mismatch or below threshold).
 #[allow(clippy::too_many_arguments)]
-fn score_candidate(
+pub(crate) fn score_candidate(
     embedding: &[f32],
     query: &[f32],
     name: Option<&str>,
@@ -735,400 +669,9 @@ fn score_candidate(
     }
 }
 
-impl Store {
-    /// Raw embedding-only cosine similarity search (no RRF, no keyword matching).
-    ///
-    /// **You almost certainly want `search_filtered()` instead.** This method skips
-    /// hybrid RRF ranking, name boosting, and all filters. It exists for tests and
-    /// internal building blocks only. Two production bugs came from calling this
-    /// directly (PR #305).
-    pub fn search_embedding_only(
-        &self,
-        query: &Embedding,
-        limit: usize,
-        threshold: f32,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        self.search_filtered(query, &SearchFilter::default(), limit, threshold)
-    }
-
-    /// Search with filters
-    pub fn search_filtered(
-        &self,
-        query: &Embedding,
-        filter: &SearchFilter,
-        limit: usize,
-        threshold: f32,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        let _span = tracing::info_span!("search_filtered", limit = limit, rrf = filter.enable_rrf)
-            .entered();
-
-        // Load notes once for note-boosted ranking (cheap — no embeddings)
-        let notes = match self.cached_notes_summaries() {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to load notes for search boosting");
-                Vec::new()
-            }
-        };
-
-        self.rt.block_on(async {
-            let fsql = build_filter_sql(filter);
-            let semantic_limit = if fsql.use_rrf { limit * 3 } else { limit };
-            let need_name = fsql.use_hybrid || filter.enable_demotion;
-
-            // Compile glob pattern once outside the loop (not per-chunk).
-            // Note: Invalid patterns are logged and silently ignored (returns all results).
-            // Callers should validate patterns upfront via SearchFilter::validate() if they
-            // want to reject invalid patterns. This lenient behavior is intentional to allow
-            // partial searches when users provide malformed patterns interactively.
-            let glob_matcher = compile_glob_filter(filter.path_pattern.as_ref());
-
-            // Pre-tokenize query for name matching (avoids re-tokenizing per result)
-            let name_matcher = if fsql.use_hybrid {
-                Some(NameMatcher::new(&filter.query_text))
-            } else {
-                None
-            };
-
-            // Pre-compute note boost lookup for O(1) name matching in scoring loop
-            let note_index = NoteBoostIndex::new(&notes);
-
-            // Use bounded heap to maintain only top-N results during iteration.
-            // This bounds memory to O(semantic_limit) instead of O(total_chunks).
-            let mut score_heap = BoundedScoreHeap::new(semantic_limit);
-
-            // Cursor-based batching: load embeddings in batches of 5000 instead of
-            // all at once. This bounds memory to O(batch_size) instead of O(total_chunks).
-            // Uses the same cursor pattern as EmbeddingBatchIterator in store/chunks.rs.
-            const BRUTE_FORCE_BATCH_SIZE: i64 = 5000;
-            let mut last_rowid: i64 = 0;
-
-            // Hoist SQL template out of cursor loop — only last_rowid changes per iteration
-            let rowid_condition = format!("rowid > ?{}", fsql.bind_values.len() + 1);
-            let limit_param = format!("?{}", fsql.bind_values.len() + 2);
-            let batch_where = if fsql.conditions.is_empty() {
-                format!(
-                    " WHERE {} ORDER BY rowid ASC LIMIT {}",
-                    rowid_condition, limit_param
-                )
-            } else {
-                format!(
-                    " WHERE {} AND {} ORDER BY rowid ASC LIMIT {}",
-                    fsql.conditions.join(" AND "),
-                    rowid_condition,
-                    limit_param
-                )
-            };
-            let sql = format!("SELECT {} FROM chunks{}", fsql.columns, batch_where);
-
-            loop {
-                let batch: Vec<_> = {
-                    let mut q = sqlx::query(&sql);
-                    for val in &fsql.bind_values {
-                        q = q.bind(val);
-                    }
-                    q = q.bind(last_rowid);
-                    q = q.bind(BRUTE_FORCE_BATCH_SIZE);
-                    q.fetch_all(&self.pool).await?
-                };
-
-                if batch.is_empty() {
-                    break;
-                }
-                last_rowid = batch
-                    .last()
-                    .expect("batch non-empty checked above")
-                    .get::<i64, _>("rowid");
-
-                for row in &batch {
-                    let id: String = row.get("id");
-                    let embedding_bytes: Vec<u8> = row.get("embedding");
-                    let name: Option<String> = if need_name { row.get("name") } else { None };
-
-                    let Some(embedding) = embedding_slice(&embedding_bytes) else {
-                        continue;
-                    };
-                    let file_part = extract_file_from_chunk_id(&id);
-
-                    if let Some(score) = score_candidate(
-                        embedding,
-                        query.as_slice(),
-                        name.as_deref(),
-                        file_part,
-                        filter,
-                        name_matcher.as_ref(),
-                        glob_matcher.as_ref(),
-                        &note_index,
-                        threshold,
-                    ) {
-                        score_heap.push(id, score);
-                    }
-                }
-            }
-
-            let scored = score_heap.into_sorted_vec();
-
-            let results = self
-                .finalize_results(scored, &filter.query_text, fsql.use_rrf, limit)
-                .await?;
-
-            tracing::debug!(count = results.len(), "search_filtered complete");
-            Ok(results)
-        })
-    }
-
-    /// Post-scoring pipeline: RRF fusion, content fetch, parent dedup, boost, truncate.
-    ///
-    /// Shared by `search_filtered` and `search_by_candidate_ids`. Both produce
-    /// `Vec<(chunk_id, score)>` through different scoring paths (brute-force vs
-    /// index-guided), then converge here for the same finalization steps.
-    ///
-    /// When `use_rrf` is true, fuses semantic rankings with FTS keyword results
-    /// via Reciprocal Rank Fusion before fetching full content. Requests `limit * 2`
-    /// candidates from RRF to compensate for parent dedup filtering.
-    async fn finalize_results(
-        &self,
-        mut scored: Vec<(String, f32)>,
-        query_text: &str,
-        use_rrf: bool,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        // Step 1: RRF fusion with FTS keyword search, or plain truncate
-        let final_scored: Vec<(String, f32)> = if use_rrf {
-            let normalized = normalize_for_fts(query_text);
-            let sanitized = sanitize_fts_query(&normalized);
-            let fts_ids = if sanitized.is_empty() {
-                vec![]
-            } else {
-                let fts_rows: Vec<(String,)> = sqlx::query_as(
-                    "SELECT id FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT ?2",
-                )
-                .bind(&sanitized)
-                .bind((limit * 3) as i64)
-                .fetch_all(&self.pool)
-                .await?;
-                fts_rows.into_iter().map(|(id,)| id).collect()
-            };
-            let semantic_ids: Vec<&str> = scored.iter().map(|(id, _)| id.as_str()).collect();
-            // Request extra candidates from RRF to compensate for parent dedup
-            // filtering below — dedup can drop results, leaving fewer than `limit`.
-            Self::rrf_fuse(&semantic_ids, &fts_ids, limit * 2)
-        } else {
-            scored.truncate(limit);
-            scored
-        };
-
-        if final_scored.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Step 2: Fetch full content only for top-N results (PF-5 payoff —
-        // heavy content/doc/signature columns loaded only for winners)
-        let ids: Vec<&str> = final_scored.iter().map(|(id, _)| id.as_str()).collect();
-        let rows_map = self.fetch_chunks_by_ids_async(&ids).await?;
-
-        // Step 3: Parent dedup — keep first occurrence per parent_id
-        let mut seen_parents: HashSet<String> = HashSet::new();
-        let mut results: Vec<SearchResult> = final_scored
-            .into_iter()
-            .filter_map(|(id, score)| {
-                let row = rows_map.get(&id)?;
-                let dedup_key = row.parent_id.clone().unwrap_or_else(|| row.id.clone());
-                if seen_parents.insert(dedup_key) {
-                    Some(SearchResult {
-                        chunk: ChunkSummary::from(row.clone()),
-                        score,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Step 4: Boost container chunks when multiple child methods appear
-        apply_parent_boost(&mut results);
-
-        // Step 5: Truncate back to requested limit after parent dedup
-        results.truncate(limit);
-
-        Ok(results)
-    }
-
-    /// Search with optional vector index for O(log n) candidate retrieval
-    pub fn search_filtered_with_index(
-        &self,
-        query: &Embedding,
-        filter: &SearchFilter,
-        limit: usize,
-        threshold: f32,
-        index: Option<&dyn VectorIndex>,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        if let Some(idx) = index {
-            let _span = tracing::info_span!("search_index_guided", limit = limit).entered();
-
-            let candidate_count = (limit * 5).max(100);
-            let index_results = idx.search(query, candidate_count);
-
-            if index_results.is_empty() {
-                tracing::info!("Index returned no candidates, falling back to brute-force search (performance may degrade)");
-                return self.search_filtered(query, filter, limit, threshold);
-            }
-
-            tracing::debug!("Index returned {} candidates", index_results.len());
-
-            let candidate_ids: Vec<&str> = index_results.iter().map(|r| r.id.as_str()).collect();
-            return self.search_by_candidate_ids(&candidate_ids, query, filter, limit, threshold);
-        }
-
-        self.search_filtered(query, filter, limit, threshold)
-    }
-
-    /// Search within a set of candidate IDs (for HNSW-guided filtered search)
-    pub fn search_by_candidate_ids(
-        &self,
-        candidate_ids: &[&str],
-        query: &Embedding,
-        filter: &SearchFilter,
-        limit: usize,
-        threshold: f32,
-    ) -> Result<Vec<SearchResult>, StoreError> {
-        let _span = tracing::info_span!(
-            "search_by_candidates",
-            candidates = candidate_ids.len(),
-            limit
-        )
-        .entered();
-
-        if candidate_ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let use_hybrid = filter.name_boost > 0.0
-            && !filter.query_text.is_empty()
-            && is_name_like_query(&filter.query_text);
-        let use_rrf = filter.enable_rrf && !filter.query_text.is_empty();
-
-        // Load notes once for note-boosted ranking
-        let notes = match self.cached_notes_summaries() {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to load notes for search boosting");
-                Vec::new()
-            }
-        };
-
-        self.rt.block_on(async {
-            // Phase 1: Lightweight candidate fetch — only scoring fields + embedding.
-            // Excludes heavy content/doc/signature columns (PF-5).
-            let candidates = self.fetch_candidates_by_ids_async(candidate_ids).await?;
-
-            // Compile glob pattern once outside the loop (not per-chunk).
-            let glob_matcher = compile_glob_filter(filter.path_pattern.as_ref());
-
-            // Pre-tokenize query for name matching (avoids re-tokenizing per result)
-            let name_matcher = if use_hybrid {
-                Some(NameMatcher::new(&filter.query_text))
-            } else {
-                None
-            };
-
-            // Pre-compute note boost lookup for O(1) name matching in scoring loop
-            let note_index = NoteBoostIndex::new(&notes);
-
-            // Pre-build filter sets once — avoids per-candidate string parsing (PF-1)
-            let lang_set: Option<HashSet<String>> = filter
-                .languages
-                .as_ref()
-                .map(|langs| langs.iter().map(|l| l.to_string().to_lowercase()).collect());
-            let type_set: Option<HashSet<String>> = filter
-                .chunk_types
-                .as_ref()
-                .map(|types| types.iter().map(|t| t.to_string().to_lowercase()).collect());
-
-            let mut scored: Vec<(CandidateRow, f32)> = candidates
-                .into_iter()
-                .filter_map(|(candidate, embedding_bytes)| {
-                    if let Some(ref langs) = lang_set {
-                        if !langs
-                            .iter()
-                            .any(|l| candidate.language.eq_ignore_ascii_case(l))
-                        {
-                            return None;
-                        }
-                    }
-
-                    if let Some(ref types) = type_set {
-                        if !types
-                            .iter()
-                            .any(|t| candidate.chunk_type.eq_ignore_ascii_case(t))
-                        {
-                            return None;
-                        }
-                    }
-
-                    let embedding = embedding_slice(&embedding_bytes)?;
-
-                    let score = score_candidate(
-                        embedding,
-                        query.as_slice(),
-                        Some(&candidate.name),
-                        &candidate.origin,
-                        filter,
-                        name_matcher.as_ref(),
-                        glob_matcher.as_ref(),
-                        &note_index,
-                        threshold,
-                    )?;
-
-                    Some((candidate, score))
-                })
-                .collect();
-
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-            let scored: Vec<(String, f32)> =
-                scored.into_iter().map(|(c, score)| (c.id, score)).collect();
-
-            self.finalize_results(scored, &filter.query_text, use_rrf, limit)
-                .await
-        })
-    }
-
-    /// Unified search with optional vector index.
-    ///
-    /// Returns code-only results (SQ-9: notes removed from search pipeline).
-    /// When an HNSW index is provided, uses O(log n) candidate retrieval.
-    pub fn search_unified_with_index(
-        &self,
-        query: &Embedding,
-        filter: &SearchFilter,
-        limit: usize,
-        threshold: f32,
-        index: Option<&dyn VectorIndex>,
-    ) -> Result<Vec<crate::store::UnifiedResult>, StoreError> {
-        if limit == 0 {
-            return Ok(vec![]);
-        }
-
-        let _span = tracing::info_span!("search_unified", limit, threshold = %threshold).entered();
-
-        let code_results =
-            self.search_filtered_with_index(query, filter, limit, threshold, index)?;
-
-        let unified: Vec<crate::store::UnifiedResult> = code_results
-            .into_iter()
-            .map(crate::store::UnifiedResult::Code)
-            .collect();
-
-        Ok(unified)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // cosine_similarity tests are in src/math.rs
 
     // ===== name_match_score tests =====
 
@@ -1382,6 +925,7 @@ mod tests {
         parent_type_name: Option<&str>,
         score: f32,
     ) -> SearchResult {
+        use crate::store::helpers::ChunkSummary;
         SearchResult {
             chunk: ChunkSummary {
                 id: name.to_string(),
@@ -1502,331 +1046,6 @@ mod tests {
         assert_eq!(results[1].score, score_before);
     }
 
-    // ===== search_filtered integration tests (TC4) =====
-
-    mod search_filtered_tests {
-        use crate::parser::{ChunkType, Language};
-        use crate::store::helpers::SearchFilter;
-        use crate::test_helpers::{mock_embedding, setup_store};
-        use std::path::PathBuf;
-
-        fn make_chunk(
-            name: &str,
-            file: &str,
-            lang: Language,
-            chunk_type: ChunkType,
-        ) -> crate::parser::Chunk {
-            let content = format!("fn {}() {{ /* body */ }}", name);
-            let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-            crate::parser::Chunk {
-                id: format!("{}:1:{}", file, &hash[..8]),
-                file: PathBuf::from(file),
-                language: lang,
-                chunk_type,
-                name: name.to_string(),
-                signature: format!("fn {}()", name),
-                content,
-                doc: None,
-                line_start: 1,
-                line_end: 5,
-                content_hash: hash,
-                parent_id: None,
-                window_idx: None,
-                parent_type_name: None,
-            }
-        }
-
-        #[test]
-        fn test_search_filtered_language_filter() {
-            let (store, _dir) = setup_store();
-
-            let rust_chunk =
-                make_chunk("rust_fn", "src/lib.rs", Language::Rust, ChunkType::Function);
-            let py_chunk = make_chunk(
-                "py_fn",
-                "src/main.py",
-                Language::Python,
-                ChunkType::Function,
-            );
-            let emb = mock_embedding(1.0);
-
-            store
-                .upsert_chunks_batch(
-                    &[(rust_chunk, emb.clone()), (py_chunk, emb.clone())],
-                    Some(12345),
-                )
-                .unwrap();
-
-            let filter = SearchFilter {
-                languages: Some(vec![Language::Rust]),
-                ..Default::default()
-            };
-            let results = store.search_filtered(&emb, &filter, 10, 0.0).unwrap();
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].chunk.language, Language::Rust);
-        }
-
-        #[test]
-        fn test_search_filtered_chunk_type_filter() {
-            let (store, _dir) = setup_store();
-
-            let fn_chunk = make_chunk("my_fn", "src/a.rs", Language::Rust, ChunkType::Function);
-            let struct_chunk =
-                make_chunk("MyStruct", "src/b.rs", Language::Rust, ChunkType::Struct);
-            let emb = mock_embedding(1.0);
-
-            store
-                .upsert_chunks_batch(
-                    &[(fn_chunk, emb.clone()), (struct_chunk, emb.clone())],
-                    Some(12345),
-                )
-                .unwrap();
-
-            let filter = SearchFilter {
-                chunk_types: Some(vec![ChunkType::Struct]),
-                ..Default::default()
-            };
-            let results = store.search_filtered(&emb, &filter, 10, 0.0).unwrap();
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].chunk.chunk_type, ChunkType::Struct);
-        }
-
-        #[test]
-        fn test_search_filtered_path_pattern() {
-            let (store, _dir) = setup_store();
-
-            let src_chunk = make_chunk("src_fn", "src/lib.rs", Language::Rust, ChunkType::Function);
-            let test_chunk = make_chunk(
-                "test_fn",
-                "tests/test.rs",
-                Language::Rust,
-                ChunkType::Function,
-            );
-            let emb = mock_embedding(1.0);
-
-            store
-                .upsert_chunks_batch(
-                    &[(src_chunk, emb.clone()), (test_chunk, emb.clone())],
-                    Some(12345),
-                )
-                .unwrap();
-
-            let filter = SearchFilter {
-                path_pattern: Some("src/**".to_string()),
-                ..Default::default()
-            };
-            let results = store.search_filtered(&emb, &filter, 10, 0.0).unwrap();
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].chunk.name, "src_fn");
-        }
-
-        #[test]
-        fn test_search_filtered_combined_filters() {
-            let (store, _dir) = setup_store();
-
-            let rust_src = make_chunk("rs_src", "src/a.rs", Language::Rust, ChunkType::Function);
-            let py_src = make_chunk("py_src", "src/b.py", Language::Python, ChunkType::Function);
-            let rust_test =
-                make_chunk("rs_test", "tests/t.rs", Language::Rust, ChunkType::Function);
-            let emb = mock_embedding(1.0);
-
-            store
-                .upsert_chunks_batch(
-                    &[
-                        (rust_src, emb.clone()),
-                        (py_src, emb.clone()),
-                        (rust_test, emb.clone()),
-                    ],
-                    Some(12345),
-                )
-                .unwrap();
-
-            let filter = SearchFilter {
-                languages: Some(vec![Language::Rust]),
-                path_pattern: Some("src/**".to_string()),
-                ..Default::default()
-            };
-            let results = store.search_filtered(&emb, &filter, 10, 0.0).unwrap();
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].chunk.name, "rs_src");
-        }
-
-        #[test]
-        fn test_search_filtered_rrf_hybrid() {
-            let (store, _dir) = setup_store();
-
-            let chunk = make_chunk(
-                "handleError",
-                "src/err.rs",
-                Language::Rust,
-                ChunkType::Function,
-            );
-            let emb = mock_embedding(1.0);
-            store
-                .upsert_chunks_batch(&[(chunk, emb.clone())], Some(12345))
-                .unwrap();
-
-            let filter = SearchFilter {
-                enable_rrf: true,
-                query_text: "error handling".to_string(),
-                ..Default::default()
-            };
-            let results = store.search_filtered(&emb, &filter, 10, 0.0).unwrap();
-            assert!(!results.is_empty(), "RRF hybrid should return results");
-        }
-
-        #[test]
-        fn test_search_filtered_name_boost() {
-            let (store, _dir) = setup_store();
-
-            let c1 = make_chunk(
-                "parseConfig",
-                "src/a.rs",
-                Language::Rust,
-                ChunkType::Function,
-            );
-            let c2 = make_chunk("renderUI", "src/b.rs", Language::Rust, ChunkType::Function);
-            let emb = mock_embedding(1.0);
-
-            store
-                .upsert_chunks_batch(&[(c1, emb.clone()), (c2, emb.clone())], Some(12345))
-                .unwrap();
-
-            // With name_boost, parseConfig should rank higher for query "parse"
-            let filter = SearchFilter {
-                name_boost: 0.3,
-                query_text: "parseConfig".to_string(),
-                ..Default::default()
-            };
-            let results = store.search_filtered(&emb, &filter, 10, 0.0).unwrap();
-            assert!(!results.is_empty());
-            // The chunk whose name matches query text should rank first
-            assert_eq!(results[0].chunk.name, "parseConfig");
-        }
-
-        #[test]
-        fn test_search_filtered_empty_store() {
-            let (store, _dir) = setup_store();
-            let emb = mock_embedding(1.0);
-            let filter = SearchFilter::default();
-            let results = store.search_filtered(&emb, &filter, 10, 0.0).unwrap();
-            assert!(results.is_empty());
-        }
-
-        /// TC-7: Verify HNSW-guided path produces RRF results when enable_rrf is true.
-        ///
-        /// The search_by_candidate_ids path must apply the same RRF fusion as
-        /// search_filtered, combining cosine-scored candidates with FTS keyword hits.
-        #[test]
-        fn test_search_by_candidate_ids_rrf() {
-            let (store, _dir) = setup_store();
-
-            // Insert chunks with content that FTS can match by keyword
-            let mut c_error = make_chunk(
-                "handleError",
-                "src/err.rs",
-                Language::Rust,
-                ChunkType::Function,
-            );
-            c_error.content =
-                "fn handleError() { log_error(\"error handling failed\"); }".to_string();
-            let mut c_parse = make_chunk(
-                "parseConfig",
-                "src/cfg.rs",
-                Language::Rust,
-                ChunkType::Function,
-            );
-            c_parse.content = "fn parseConfig() { read_toml(\"config.toml\"); }".to_string();
-            let emb1 = mock_embedding(1.0);
-            let emb2 = mock_embedding(0.9);
-
-            store
-                .upsert_chunks_batch(
-                    &[(c_error.clone(), emb1.clone()), (c_parse.clone(), emb2)],
-                    Some(12345),
-                )
-                .unwrap();
-
-            // Search by candidate IDs with RRF enabled — FTS should boost "handleError"
-            // for the query text "error handling"
-            let candidate_ids: Vec<&str> = vec![&c_error.id, &c_parse.id];
-            let filter = SearchFilter {
-                enable_rrf: true,
-                query_text: "error handling".to_string(),
-                ..Default::default()
-            };
-
-            let results = store
-                .search_by_candidate_ids(&candidate_ids, &emb1, &filter, 10, 0.0)
-                .unwrap();
-
-            assert!(
-                !results.is_empty(),
-                "RRF in candidate path should return results"
-            );
-            // "handleError" should rank first because it matches both semantically
-            // and via FTS keyword "error"
-            assert_eq!(
-                results[0].chunk.name, "handleError",
-                "FTS+RRF should boost the keyword-matching chunk"
-            );
-
-            // Compare with non-RRF path to verify RRF actually changes behavior
-            let filter_no_rrf = SearchFilter {
-                enable_rrf: false,
-                query_text: "error handling".to_string(),
-                ..Default::default()
-            };
-            let results_no_rrf = store
-                .search_by_candidate_ids(&candidate_ids, &emb1, &filter_no_rrf, 10, 0.0)
-                .unwrap();
-            assert!(
-                !results_no_rrf.is_empty(),
-                "Non-RRF candidate path should also return results"
-            );
-        }
-
-        #[test]
-        fn test_search_filtered_respects_threshold() {
-            let (store, _dir) = setup_store();
-
-            let c1 = make_chunk("fn_a", "src/a.rs", Language::Rust, ChunkType::Function);
-            let emb_opposite = mock_embedding(-1.0);
-            store
-                .upsert_chunks_batch(&[(c1, emb_opposite)], Some(12345))
-                .unwrap();
-
-            let query = mock_embedding(1.0);
-            let filter = SearchFilter::default();
-            let results = store.search_filtered(&query, &filter, 10, 0.99).unwrap();
-            assert!(
-                results.is_empty(),
-                "Opposite embedding should not meet 0.99 threshold"
-            );
-        }
-
-        #[test]
-        fn test_search_filtered_respects_limit() {
-            let (store, _dir) = setup_store();
-
-            for i in 0..10 {
-                let c = make_chunk(
-                    &format!("fn_{}", i),
-                    &format!("src/{}.rs", i),
-                    Language::Rust,
-                    ChunkType::Function,
-                );
-                let emb = mock_embedding(1.0 + i as f32 * 0.001);
-                store.upsert_chunks_batch(&[(c, emb)], Some(12345)).unwrap();
-            }
-
-            let query = mock_embedding(1.0);
-            let filter = SearchFilter::default();
-            let results = store.search_filtered(&query, &filter, 3, 0.0).unwrap();
-            assert_eq!(results.len(), 3);
-        }
-    }
-
     // ===== chunk_importance tests =====
 
     #[test]
@@ -1844,7 +1063,7 @@ mod tests {
         // Go convention: TestFoo
         assert_eq!(
             chunk_importance("TestParseConfig", "src/lib.go"),
-            IMPORTANCE_TEST
+            ScoringConfig::DEFAULT.importance_test
         );
     }
 
@@ -1852,7 +1071,7 @@ mod tests {
     fn test_chunk_importance_underscore() {
         assert_eq!(
             chunk_importance("_helper", "src/lib.rs"),
-            IMPORTANCE_PRIVATE
+            ScoringConfig::DEFAULT.importance_private
         );
     }
 
@@ -1867,7 +1086,7 @@ mod tests {
         // File named foo_test.rs → demotion via filename
         assert_eq!(
             chunk_importance("helper_fn", "src/foo_test.rs"),
-            IMPORTANCE_TEST
+            ScoringConfig::DEFAULT.importance_test
         );
     }
 
@@ -1876,14 +1095,17 @@ mod tests {
         // Files in tests/ directory are test infrastructure → demoted
         assert_eq!(
             chunk_importance("real_fn", "tests/fixtures/eval.rs"),
-            IMPORTANCE_TEST
+            ScoringConfig::DEFAULT.importance_test
         );
     }
 
     #[test]
     fn test_chunk_importance_test_name_beats_path() {
         // test_ name triggers demotion even in normal directory
-        assert_eq!(chunk_importance("test_foo", "src/lib.rs"), IMPORTANCE_TEST);
+        assert_eq!(
+            chunk_importance("test_foo", "src/lib.rs"),
+            ScoringConfig::DEFAULT.importance_test
+        );
     }
 
     // ===== is_name_like_query tests =====
@@ -2297,7 +1519,7 @@ mod tests {
             boost > 1.0,
             "Positive sentiment should boost > 1.0, got {boost}"
         );
-        assert!((boost - (1.0 + 0.5 * NOTE_BOOST_FACTOR)).abs() < 1e-6);
+        assert!((boost - (1.0 + 0.5 * ScoringConfig::DEFAULT.note_boost_factor)).abs() < 1e-6);
     }
 
     #[test]
@@ -2314,7 +1536,7 @@ mod tests {
             boost < 1.0,
             "Negative sentiment should reduce score, got {boost}"
         );
-        assert!((boost - (1.0 - 1.0 * NOTE_BOOST_FACTOR)).abs() < 1e-6);
+        assert!((boost - (1.0 - 1.0 * ScoringConfig::DEFAULT.note_boost_factor)).abs() < 1e-6);
     }
 
     #[test]
@@ -2362,7 +1584,7 @@ mod tests {
             boost < 1.0,
             "Stronger negative should win over weaker positive, got {boost}"
         );
-        assert!((boost - (1.0 - 1.0 * NOTE_BOOST_FACTOR)).abs() < 1e-6);
+        assert!((boost - (1.0 - 1.0 * ScoringConfig::DEFAULT.note_boost_factor)).abs() < 1e-6);
     }
 
     #[test]
