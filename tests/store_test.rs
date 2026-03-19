@@ -195,7 +195,7 @@ fn test_prune_missing() {
 }
 
 #[test]
-fn test_get_by_content_hash() {
+fn test_get_embeddings_by_hashes_single() {
     let store = TestStore::new();
 
     let content = "fn test() { 42 }";
@@ -204,12 +204,20 @@ fn test_get_by_content_hash() {
     store.upsert_chunk(&chunk, &embedding, Some(12345)).unwrap();
 
     // Should find embedding by content hash
-    let found = store.get_by_content_hash(&chunk.content_hash);
-    assert!(found.is_some());
+    let found = store
+        .get_embeddings_by_hashes(&[&chunk.content_hash])
+        .unwrap();
+    assert!(
+        found.contains_key(&chunk.content_hash),
+        "Should find embedding for existing content hash"
+    );
 
     // Should not find non-existent hash
-    let not_found = store.get_by_content_hash("nonexistent");
-    assert!(not_found.is_none());
+    let not_found = store.get_embeddings_by_hashes(&["nonexistent"]).unwrap();
+    assert!(
+        not_found.is_empty(),
+        "Should return empty map for non-existent hash"
+    );
 }
 
 #[test]
@@ -793,13 +801,13 @@ fn test_all_chunk_identities() {
 
     // Find chunk1 identity
     let id1 = identities.iter().find(|i| i.name == "fn1").unwrap();
-    assert_eq!(id1.origin, "test.rs");
+    assert_eq!(id1.file.to_string_lossy(), "test.rs");
     assert_eq!(id1.language, Language::Rust);
     assert_eq!(id1.line_start, 1);
 
     // Find chunk2 identity
     let id2 = identities.iter().find(|i| i.name == "fn2").unwrap();
-    assert_eq!(id2.origin, "other.rs");
+    assert_eq!(id2.file.to_string_lossy(), "other.rs");
     assert_eq!(id2.line_start, 10);
 }
 
