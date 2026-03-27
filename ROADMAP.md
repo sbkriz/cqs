@@ -1,21 +1,35 @@
 # Roadmap
 
-## Current: v1.6.0
+## Current: v1.7.0
 
-v1.6.0: 6th full audit (82/82 fixed), FieldStyle field extraction (28 languages), BatchProvider trait, runtime embedding dim, CallGraph Arc<str>, CLI/store splits, lazy enrichment, GC single transaction. 1993 tests.
+v1.7.0: Configurable embedding models, 7th audit (85/95 fixed), nl.rs split, BatchSubmitItem, LlmProvider enum, skip_line_prefixes on 51 languages, 24 new tests. 1490 tests.
+
+v1.6.0: 6th full audit (82/82 fixed), FieldStyle field extraction (28 languages), BatchProvider trait, runtime embedding dim, CallGraph Arc<str>, CLI/store splits, lazy enrichment, GC single transaction.
 
 ### Key Finding (2026-03-26)
 Enrichment stack contributes 43.6pp to hard eval (49.1% raw → 92.7% enriched). Model size is NOT the bottleneck — E5-large (3x params) scores the same as E5-base. Instruction models (GTE-Qwen2 1.5B, E5-mistral 7B) score WORSE. BGE-large best raw embedder at 61.8%.
 
-### Next — Embedding Model Options
-- [ ] BGE-large-en-v1.5 as configurable alternative (plan: `docs/superpowers/plans/2026-03-26-bge-large-model-option.md`)
-- [ ] ModelConfig registry with per-model prefix/dim/repo
+### Done — Embedding Model Options
+- [x] BGE-large-en-v1.5 as configurable alternative
+- [x] ModelConfig registry with per-model prefix/dim/repo
 - [ ] Eval: BGE-large + enrichment vs E5-base + enrichment
 
-### Next — Training (Exp 18: v9-mini)
-- [ ] v9-mini training (in progress) — Stack data + call-graph false-negative filter + synthetic queries
-- [ ] Eval against base E5 (success bar: R@1 ≥ 92.7% AND CSN ≥ 0.627)
-- [ ] If successful: v9-full with curriculum scheduling + test-derived queries
+### Done — Training (Exp 18: v9-mini)
+- [x] v9-mini training — Stack data + call-graph false-negative filter + synthetic queries
+- [x] Eval: 65.5% raw R@1, 89.1% enriched, 0.638 CSN (matches base enriched, better raw+CSN)
+
+### Next — Dataset & Training
+**Raw pool**: 2.8M pairs across 9 languages from ~5,000 repos. Bottleneck: C++ at 115K.
+
+- [ ] Gap-filling completes (~90%, actively indexing)
+- [ ] Publish HuggingFace datasets:
+  - `cqs-code-search-200k` — 22,222 × 9 balanced, call graph metadata
+  - `cqs-code-search-500k` — 55,555 × 9 balanced (stretch)
+  - `cqs-code-search-1m` — 114,787 × 9 balanced (max, C++ bottleneck)
+- [ ] Mine hard negatives (call-graph false-negative filtering, zero API cost)
+- [ ] Train v9-200k → eval
+- [ ] Train v9-1m → eval (if 200k shows improvement)
+- [ ] Paper v0.6
 
 ### Next — Agent Adoption (cqs telemetry shows 87% search, 0% advanced commands)
 Current: CLAUDE.md restructured with task-triggered commands (2026-03-26). Check telemetry next session.

@@ -74,13 +74,7 @@ impl HnswIndex {
         // Test-only path: allocates the full Vec<Vec<f32>> double-buffer here.
         // Production code uses `build_batched` to avoid this peak allocation.
         // Reconstruct Vec<f32> chunks from flat buffer for hnsw_rs API
-        let chunks: Vec<Vec<f32>> = (0..nb_elem)
-            .map(|i| {
-                let start = i * dim;
-                let end = start + dim;
-                data[start..end].to_vec()
-            })
-            .collect();
+        let chunks: Vec<Vec<f32>> = data.chunks_exact(dim).map(|c| c.to_vec()).collect();
         let data_for_insert: Vec<(&Vec<f32>, usize)> =
             chunks.iter().enumerate().map(|(i, v)| (v, i)).collect();
 
@@ -173,8 +167,8 @@ impl HnswIndex {
                     });
                 }
                 // Skip zero-vector embeddings — they produce NaN cosine distances
-                let norm_sq: f32 = embedding.as_vec().iter().map(|x| x * x).sum();
-                if norm_sq == 0.0 {
+                // PERF-37: short-circuit on first non-zero element instead of full L2 norm
+                if !embedding.as_vec().iter().any(|x| *x != 0.0) {
                     tracing::warn!(chunk_id = %chunk_id, "Skipping zero-vector embedding");
                     continue;
                 }
@@ -187,7 +181,7 @@ impl HnswIndex {
             // Insert this batch (hnsw_rs supports consecutive parallel_insert calls)
             hnsw.parallel_insert_data(&data_for_insert);
 
-            total_inserted += batch.len();
+            total_inserted += data_for_insert.len();
             batch_num += 1;
             tracing::debug!(
                 batch = batch_num,
@@ -341,5 +335,112 @@ mod tests {
         let batched_found = batched_results.iter().any(|r| r.id == "item10");
         assert!(regular_found, "Regular build should find item10 in top 10");
         assert!(batched_found, "Batched build should find item10 in top 10");
+    }
+
+    // ===== TC-31: multi-model dim-threading (HNSW build) =====
+
+    /// Create a deterministic normalized embedding of arbitrary dimension.
+    fn make_embedding_dim(seed: u32, dim: usize) -> Embedding {
+        let mut v = vec![0.0f32; dim];
+        for (i, val) in v.iter_mut().enumerate() {
+            *val = ((seed as f32 * 0.1) + (i as f32 * 0.001)).sin();
+        }
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for val in &mut v {
+                *val /= norm;
+            }
+        }
+        Embedding::new(v)
+    }
+
+    #[test]
+    fn tc31_build_batched_with_dim_1024() {
+        // TC-31.4: Build HNSW index with 1024-dim embeddings via build_batched_with_dim.
+        let all_embeddings: Vec<(String, Embedding)> = (1..=10)
+            .map(|i| (format!("chunk{}", i), make_embedding_dim(i, 1024)))
+            .collect();
+
+        let batches: Vec<Result<Vec<(String, Embedding)>, std::convert::Infallible>> =
+            all_embeddings
+                .chunks(5)
+                .map(|chunk| Ok(chunk.to_vec()))
+                .collect();
+
+        let index = HnswIndex::build_batched_with_dim(batches.into_iter(), 10, 1024).unwrap();
+        assert_eq!(index.len(), 10, "HNSW index should have 10 vectors");
+        assert_eq!(index.dim, 1024, "HNSW index dim should be 1024");
+
+        // Search should work with 1024-dim queries
+        let query = make_embedding_dim(1, 1024);
+        let results = index.search(&query, 3);
+        assert!(!results.is_empty(), "Search should return results");
+        assert_eq!(results[0].id, "chunk1", "Nearest neighbor should be chunk1");
+    }
+
+    #[test]
+    fn tc31_build_with_dim_1024() {
+        // TC-31.4 variant: Single-pass build with 1024-dim.
+        let embeddings: Vec<(String, Embedding)> = (1..=5)
+            .map(|i| (format!("item{}", i), make_embedding_dim(i, 1024)))
+            .collect();
+
+        let index = HnswIndex::build_with_dim(embeddings, 1024).unwrap();
+        assert_eq!(index.len(), 5);
+        assert_eq!(index.dim, 1024);
+
+        let query = make_embedding_dim(3, 1024);
+        let results = index.search(&query, 5);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, "item3");
+    }
+
+    #[test]
+    fn tc31_build_batched_dim_mismatch_rejected() {
+        // TC-31.4b: Feeding 768-dim embeddings to a 1024-dim build should fail.
+        let bad_embeddings: Vec<(String, Embedding)> = (1..=3)
+            .map(|i| (format!("chunk{}", i), make_embedding(i))) // 768-dim
+            .collect();
+
+        let batches: Vec<Result<Vec<(String, Embedding)>, std::convert::Infallible>> =
+            vec![Ok(bad_embeddings)];
+
+        let result = HnswIndex::build_batched_with_dim(batches.into_iter(), 3, 1024);
+        assert!(
+            result.is_err(),
+            "build_batched_with_dim should reject dimension mismatch"
+        );
+        match result {
+            Err(HnswError::DimensionMismatch { expected, actual }) => {
+                assert_eq!(expected, 1024);
+                assert_eq!(actual, crate::EMBEDDING_DIM);
+            }
+            Err(other) => panic!("Expected DimensionMismatch, got: {:?}", other),
+            Ok(_) => panic!("Expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn tc40_build_batched_with_dim_zero() {
+        // TC-40: dim=0 with no embeddings should produce an empty index (not panic)
+        let batches: Vec<Result<Vec<(String, Embedding)>, std::convert::Infallible>> = vec![];
+        let index = HnswIndex::build_batched_with_dim(batches.into_iter(), 0, 0).unwrap();
+        assert!(
+            index.is_empty(),
+            "dim=0 with empty batches should yield empty index"
+        );
+    }
+
+    #[test]
+    fn tc40_build_batched_with_dim_zero_nonempty_errors() {
+        // TC-40: dim=0 with actual embeddings should fail on dimension mismatch
+        let embeddings: Vec<(String, Embedding)> = vec![("chunk1".to_string(), make_embedding(1))];
+        let batches: Vec<Result<Vec<(String, Embedding)>, std::convert::Infallible>> =
+            vec![Ok(embeddings)];
+        let result = HnswIndex::build_batched_with_dim(batches.into_iter(), 1, 0);
+        assert!(
+            result.is_err(),
+            "dim=0 with non-empty embeddings should error on dimension mismatch"
+        );
     }
 }

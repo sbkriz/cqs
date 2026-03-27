@@ -161,8 +161,17 @@ const HYDE_MAX_TOKENS: u32 = 150;
 /// Poll interval for batch completion
 const BATCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// LLM API provider type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LlmProvider {
+    /// Anthropic Messages Batches API (default)
+    Anthropic,
+    // Future: OpenAI, Local, etc.
+}
+
 /// Resolved LLM configuration (env vars > config file > constants).
 pub struct LlmConfig {
+    pub provider: LlmProvider,
     pub api_base: String,
     pub model: String,
     pub max_tokens: u32,
@@ -171,11 +180,18 @@ pub struct LlmConfig {
 impl LlmConfig {
     /// Resolve config with priority: env vars > config file > hardcoded constants.
     pub fn resolve(config: &crate::config::Config) -> Self {
-        let api_base = std::env::var("CQS_LLM_API_BASE")
-            .or_else(|_| std::env::var("CQS_API_BASE"))
-            .ok()
-            .or_else(|| config.llm_api_base.clone())
-            .unwrap_or_else(|| API_BASE.to_string());
+        let _span = tracing::info_span!("resolve_llm_config").entered();
+
+        let (api_base, api_base_source) = if let Ok(val) = std::env::var("CQS_LLM_API_BASE") {
+            (val, "env:CQS_LLM_API_BASE")
+        } else if let Ok(val) = std::env::var("CQS_API_BASE") {
+            (val, "env:CQS_API_BASE")
+        } else if let Some(val) = config.llm_api_base.clone() {
+            (val, "config")
+        } else {
+            (API_BASE.to_string(), "default")
+        };
+        tracing::debug!(source = api_base_source, "api_base resolved");
 
         if !api_base.starts_with("https://") {
             tracing::warn!(
@@ -184,19 +200,83 @@ impl LlmConfig {
             );
         }
 
+        let provider = match std::env::var("CQS_LLM_PROVIDER").ok().as_deref() {
+            Some("anthropic") | None => {
+                tracing::debug!(
+                    source = "env/default",
+                    provider = "anthropic",
+                    "provider resolved"
+                );
+                LlmProvider::Anthropic
+            }
+            Some(other) => {
+                tracing::warn!(
+                    provider = other,
+                    "Unknown CQS_LLM_PROVIDER, defaulting to anthropic"
+                );
+                LlmProvider::Anthropic
+            }
+        };
+
+        let (model, model_source) = if let Ok(val) = std::env::var("CQS_LLM_MODEL") {
+            (val, "env:CQS_LLM_MODEL")
+        } else if let Some(val) = config.llm_model.clone() {
+            (val, "config")
+        } else {
+            (MODEL.to_string(), "default")
+        };
+        tracing::debug!(source = model_source, "model resolved");
+
+        let (max_tokens, max_tokens_source) = match std::env::var("CQS_LLM_MAX_TOKENS") {
+            Ok(s) => match s.parse::<u32>() {
+                Ok(v) => (v, "env:CQS_LLM_MAX_TOKENS"),
+                Err(e) => {
+                    tracing::warn!(
+                        value = %s,
+                        error = %e,
+                        "CQS_LLM_MAX_TOKENS is set but not a valid u32, falling back"
+                    );
+                    if let Some(v) = config.llm_max_tokens {
+                        (v, "config")
+                    } else {
+                        (MAX_TOKENS, "default")
+                    }
+                }
+            },
+            Err(_) => {
+                if let Some(v) = config.llm_max_tokens {
+                    (v, "config")
+                } else {
+                    (MAX_TOKENS, "default")
+                }
+            }
+        };
+        tracing::debug!(source = max_tokens_source, "max_tokens resolved");
+
         Self {
+            provider,
             api_base,
-            model: std::env::var("CQS_LLM_MODEL")
-                .ok()
-                .or_else(|| config.llm_model.clone())
-                .unwrap_or_else(|| MODEL.to_string()),
-            max_tokens: std::env::var("CQS_LLM_MAX_TOKENS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or(config.llm_max_tokens)
-                .unwrap_or(MAX_TOKENS),
+            model,
+            max_tokens,
         }
     }
+}
+
+/// Create a batch provider from the resolved config.
+///
+/// EX-31/EX-34: Single factory, provider-aware. Currently only Anthropic is supported.
+pub fn create_client(llm_config: LlmConfig) -> Result<LlmClient, LlmError> {
+    // EX-34: When adding providers, match on llm_config.provider here
+    // and return the appropriate Box<dyn BatchProvider>.
+    let env_var = match llm_config.provider {
+        LlmProvider::Anthropic => "ANTHROPIC_API_KEY",
+    };
+    let api_key = std::env::var(env_var).map_err(|_| {
+        LlmError::ApiKeyMissing(format!(
+            "{env_var} environment variable required for LLM features"
+        ))
+    })?;
+    LlmClient::new(&api_key, llm_config)
 }
 
 /// Claude API client for generating summaries.
