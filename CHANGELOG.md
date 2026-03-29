@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-03-29
+
+### Added
+- **`VectorIndex::dim()` trait method** — both HnswIndex and CagraIndex expose dimension through the trait.
+- **`CQS_CAGRA_THRESHOLD` env var** — override the 5000-vector threshold for GPU-accelerated CAGRA index.
+- **`CQS_HYDE_MAX_TOKENS` env var** — configure HyDE prediction token budget (default: 150).
+- **`OutputArgs`/`TextJsonArgs` shared structs** — reduced per-command boilerplate for `--json`/`--format` flags.
+- **`WatchConfig`/`WatchState` structs** — replaced 12-parameter `process_file_changes` with clean context structs.
+- **`ParserStageContext` struct** — reduced pipeline `parser_stage` from 8 to 3 parameters.
+- **Pre-Edit hook** (`.claude/hooks/pre-edit-context.py`) — auto-injects module context for `.rs` files before edits.
+- **21 new tests** — SEC-20 path traversal, SearchFilter validation, validate_f32, phantom chunks, CQS_ONNX_DIR paths, batch error paths, watch module (1511 total).
+
+### Changed
+- **`ModelInfo.dimensions`: u32 → usize** — eliminates `as u32`/`as usize` casts at every boundary.
+- **`ModelInfo` moved to `embedder::models`** — re-exported from `store::helpers` for compatibility.
+- **`full_cosine_similarity` uses f64 accumulators** — fixes precision loss at 1024+ dimensions (AC-28).
+- **Contrastive neighbor extraction: O(N) via `select_nth_unstable_by`** — was O(N²) BinaryHeap per row (PERF-43).
+- **Enrichment batch: single UPDATE...FROM join** — was N individual UPDATEs per transaction (PERF-40).
+- **Notes cache: `Arc<Vec<NoteSummary>>`** — was deep-clone per search (PERF-46).
+- **Notes loaded once per search** — was loaded + indexed twice (PERF-44).
+- **Audit skill: steps 8-9** — prompt generation + review catches ~33% of fix errors before execution.
+
+### Fixed
+- **RB-34**: `build_with_dim(dim=0)` no longer panics — returns `Err` instead of `chunks_exact(0)` panic.
+- **RB-29**: Empty chunk names no longer produce zero-vector embeddings — fallback to file path.
+- **DS-33**: `delete_phantom_chunks` uses temp table — was exceeding SQLite 999-parameter limit.
+- **RM-37**: Batch response size cap enforced via `Read::take()` — was bypassed by chunked encoding.
+- **AC-25**: BFS inner-loop node cap — prevents overshoot past 10K nodes on hub functions.
+- **DS-35**: Watch loads existing HNSW on restart — prevents orphan vector accumulation.
+- **RB-31**: `grammar()` → `try_grammar()` at all 9 parser call sites — prevents panic on grammar-less languages.
+- **EH-40**: Batch `resume()` single hash call — fixes TOCTOU double-query.
+- **EH-43**: `submit_fresh` propagates `set_pending` failure — batch ID no longer silently lost.
+- **SEC-28**: Custom `[embedding] repo` validated — prevents path traversal in model configs.
+- **SEC-25/PB-32**: `CQS_ONNX_DIR` path canonicalized with `dunce`.
+- **SEC-26**: `api_base` URL credentials redacted in logs.
+- **SEC-29**: `webhelp_to_markdown` checks `content/` symlink before walk.
+- **DS-34**: Watch notes lock held for entire parse+index cycle.
+- **RB-33**: `rewrite_file` uses exclusive file lock.
+- **TC-48**: `clamp_config_f32` NaN now clamped to min (was passthrough).
+- 9 stale E5-base-v2/768-dim references updated across README, SECURITY.md, CLI help, and source comments.
+- 5 missing tracing spans added (detect_provider, create_session, parse_unified_diff, find_changed_functions, audit state).
+- 3 silently swallowed errors now warn before fallback (notes_need_reindex, chunk_count, response body decode).
+
 ## [1.9.0] - 2026-03-27
 
 ### Changed
