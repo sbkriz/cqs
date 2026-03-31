@@ -820,6 +820,8 @@ define_languages! {
     Markdown => "markdown", feature = "lang-markdown", module = markdown;
     /// ASP.NET Web Forms (.aspx, .ascx, .asmx, .master files)
     Aspx => "aspx", feature = "lang-aspx", module = aspx;
+    /// IEC 61131-3 Structured Text (.st, .stl files)
+    StructuredText => "structured_text", feature = "lang-st", module = structured_text;
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,6 +1291,10 @@ mod tests {
             expected += 1;
         }
         #[cfg(feature = "lang-aspx")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "lang-st")]
         {
             expected += 1;
         }
